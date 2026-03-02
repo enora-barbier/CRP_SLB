@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Models — temporary training artefacts
+models/tmp*/
+*.pth
+
+# Data — large files (manage with DVC or download scripts)
+# Uncomment if data should not be tracked:
+# datasets/*/data/
+
+# OS
+.DS_Store
+Thumbs.db
