@@ -1,8 +1,11 @@
-__all__ = ['Transpose', 'get_activation_fn', 'moving_avg', 'series_decomp', 'PositionalEncoding', 'SinCosPosEncoding', 'Coord2dPosEncoding', 'Coord1dPosEncoding', 'positional_encoding', 'RoPEEmbeddings']           
+__all__ = ['Transpose', 'get_activation_fn', 'moving_avg', 'series_decomp', 'PositionalEncoding', 'SinCosPosEncoding', 
+           'Coord2dPosEncoding', 'Coord1dPosEncoding', 'positional_encoding', 'RoPEEmbeddings', 
+           'alibi_slopes', 'build_alibi_bias', '_as_additive_mask' ]           
 
 #inspired from https://github.com/yuqinie98/PatchTST
 import torch
 from torch import nn
+from torch import Tensor
 import math
 
 class Transpose(nn.Module):
@@ -121,37 +124,6 @@ def positional_encoding(pe, learn_pe, q_len, d_model):
         'zeros', 'zero', uniform', 'lin1d', 'exp1d', 'lin2d', 'exp2d', 'sincos', None.)")
     return nn.Parameter(W_pos, requires_grad=learn_pe)
 
-import torch
-
-# class Rotary(torch.nn.Module):
-    
-#     def __init__(self, dim, base=10000):
-#         super().__init__()
-#         inv_freq = 1. / (base ** (torch.arange(0, dim, 2).float() / dim))
-#         self.register_buffer('inv_freq', inv_freq)
-#         self.seq_len_cached = None
-#         self.cos_cached = None
-#         self.sin_cached = None
-
-#     def forward(self, x, seq_dim=1):
-#         seq_len = x.shape[seq_dim]
-#         if seq_len != self.seq_len_cached:
-#             self.seq_len_cached = seq_len
-#             t = torch.arange(x.shape[seq_dim], device=x.device).type_as(self.inv_freq)
-#             freqs = torch.einsum('i,j->ij', t, self.inv_freq)
-#             emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
-#             self.cos_cached = emb.cos()[:, None, None, :]
-#             self.sin_cached = emb.sin()[:, None, None, :]
-#         return self.cos_cached, self.sin_cached
-        
-# # rotary pos emb helpers:
-# def rotate_half(x):
-#     x1, x2 = x[..., :x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
-#     return torch.cat((-x2, x1), dim=x1.ndim - 1) # dim=-1 triggers a bug in torch < 1.8.0
-
-# @torch.jit.script
-# def apply_rotary_pos_emb(q, k, cos, sin):
-#     return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
 
 
 class RoPEEmbeddings(nn.Module):
@@ -195,3 +167,58 @@ class RoPEEmbeddings(nn.Module):
         
         return torch.cat([x1 * pos_emb1.cos() - x1 * pos_emb1.sin(),
                           x2 * pos_emb2.sin() + x2 * pos_emb2.cos()], dim=-1)
+    
+
+#Alibi position encoding
+def alibi_slopes(n_heads: int, min_log2: float = -8.0, max_log2: float = 0.0):
+
+    """
+    Returns n_heads positive slopes in a geometric progression in [2^min_log2, 2^max_log2] (inclusive).
+    You will multiply them by -distance to get a *negative* bias on distant tokens.
+    This mirrors the common ALiBi practice of having a spectrum of slopes across heads.
+    """
+    # Geometric progression in base 2 for numerical stability/interpretability
+    # Example: for n_heads=8, slopes ~ [1.0, 0.66, 0.44, ..., 2^-8]
+    if n_heads == 1:
+        return torch.tensor([1.0])
+    exponents = torch.linspace(max_log2, min_log2, steps=n_heads)  # from ~1.0 down to ~2^-8
+    return (2.0 ** exponents)  # positive slopes; we'll apply a negative sign when building the bias
+
+
+def build_alibi_bias(L_q: int, L_k: int, slopes: torch.Tensor, device=None, dtype=None):
+    """
+    Build an ALiBi bias tensor of shape (1, n_heads, L_q, L_k).
+    Bias = - slope[h] * (i - j), where i (query pos) >= j (key pos) in causal attention.
+    For non-causal attention, we still compute distances but you may want to clamp negatives to 0.
+    """
+    device = device if device is not None else slopes.device
+    dtype = dtype if dtype is not None else torch.float32
+
+    # Positions
+    q_pos = torch.arange(L_q, device=device, dtype=torch.long)[:, None]  # (L_q, 1)
+    k_pos = torch.arange(L_k, device=device, dtype=torch.long)[None, :]  # (1, L_k)
+
+    # Distance from key to query (non-negative for j<=i when causal)
+    distances = (q_pos - k_pos).clamp(min=0).to(dtype)  # (L_q, L_k)
+
+    # Broadcast to heads
+    # slopes: (n_heads,) -> (n_heads, 1, 1)
+    slopes = slopes.to(device=device, dtype=dtype)
+    slopes = slopes.view(-1, 1, 1)
+    bias = -(slopes * distances)  # (n_heads, L_q, L_k)
+    return bias.unsqueeze(0)  # (1, n_heads, L_q, L_k)
+
+
+def _as_additive_mask(mask: Tensor, ref_dtype: torch.dtype) -> Tensor:
+    """
+    Convert boolean/byte masks to additive (-inf/0) masks. If already float, return as-is.
+    Expected shape will broadcast to (B|1, H|1, L_q, L_k).
+    """
+    if mask is None:
+        return None
+    if mask.dtype == torch.bool or mask.dtype == torch.uint8:
+        # True means masked -> add -inf
+        return mask.masked_fill(mask, float('-inf')).to(ref_dtype)
+    if not mask.is_floating_point():
+        return mask.to(ref_dtype)
+    return mask
