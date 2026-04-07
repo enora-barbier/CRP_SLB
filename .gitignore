@@ -19,6 +19,10 @@ models/tmp*/
 # Uncomment if data should not be tracked:
 # datasets/*/data/
 
+# Large save files — exceed GitHub's 100 MB limit
+datasets/north_sea/Classification/warm_state.pkl
+datasets/north_sea/Classification/warm_df_test_g.parquet
+
 # OS
 .DS_Store
 Thumbs.db
