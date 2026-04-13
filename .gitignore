@@ -20,8 +20,12 @@ models/tmp*/
 # datasets/*/data/
 
 # Large save files — exceed GitHub's 100 MB limit
-datasets/north_sea/Classification/warm_state.pkl
-datasets/north_sea/Classification/warm_df_test_g.parquet
+datasets/north_sea/Classification/depth/warm_df_test_g_depth.parquet
+datasets/north_sea/Classification/no_depth/warm_df_test_g.parquet
+
+*.pkl
+*.parquet
+*.npz
 
 # OS
 .DS_Store

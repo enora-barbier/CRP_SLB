@@ -307,17 +307,46 @@ def get_markers(df_test_log : pd.DataFrame
         return [np.nan] * n_markers, pd.DataFrame(columns=pred_column + ['Depth'])
 
     test_ds_well = dls.dataset.add_test(well_seq)
+    # OLD: well_seq kept alive until function return (~30-60 MB per well)
+    del well_seq  # free large numpy array after add_test consumes it
     test_dl_well = valid_dl.new(test_ds_well)
-    #next(iter(test_dl))
-    test_probas, *_ = learn.get_preds(dl=test_dl_well, save_preds=None)
-    test_prob = test_probas.detach().numpy()
+
+    # OLD: learn.get_preds() accumulates ALL batch outputs on GPU before returning,
+    # causing OOM on cloud VMs for large wells (11k+ windows).
+    # test_probas, *_ = learn.get_preds(dl=test_dl_well, save_preds=None)
+    # test_prob = test_probas.detach().cpu().numpy()
+
+    # NEW: manual batch loop — move each batch result to CPU immediately.
+    # Same speed as get_preds (identical forward passes), just doesn't hoard GPU memory.
+    import torch as _torch
+    _chunks = []
+    learn.model.eval()
+    with _torch.no_grad():
+        for batch in test_dl_well:
+            xb = batch[0] if isinstance(batch, (list, tuple)) else batch
+            out = learn.model(xb)
+            _chunks.append(out.detach().cpu().numpy())
+            del out, xb
+    test_prob = np.concatenate(_chunks, axis=0)
+    del _chunks, test_ds_well, test_dl_well
     df_wm = pd.DataFrame(test_prob, columns=pred_column)
+    # OLD: test_prob kept alive alongside df_wm (duplicate memory)
+    del test_prob  # numpy array consumed by DataFrame
     df_wm['Depth'] = dep_seq
-    
-    if 'Depth' not in df_gr.columns:
-        df_gr['Depth'] = df_gr.index
-        
-    df_wm = df_gr.merge(df_wm, how = 'inner', left_on = 'Depth', right_on = 'Depth')
+
+    # OLD: merged on the 'Depth' column — breaks when the depth-normalization patch
+    # is active because df_gr['Depth'] is scaled to [0,1] while dep_seq stays in
+    # original integer feet, producing zero matches and skipping every well.
+    # if 'Depth' not in df_gr.columns:
+    #     df_gr['Depth'] = df_gr.index
+    # df_wm = df_gr.merge(df_wm, how = 'inner', left_on = 'Depth', right_on = 'Depth')
+
+    # NEW: always reset df_gr['Depth'] to the integer index before merging, so the
+    # join and downstream marker-depth lookups use real feet regardless of normalization.
+    df_gr['Depth'] = df_gr.index
+    df_wm = df_gr.merge(df_wm, how='inner', left_on='Depth', right_on='Depth')
+    # OLD: df_gr kept alive until function return (duplicate of data now in df_wm)
+    del df_gr  # merged into df_wm, no longer needed
     #print(df_wm.head())
     pred_m = []
     df_wmn = df_wm
