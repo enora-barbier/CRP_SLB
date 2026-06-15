@@ -133,3 +133,8 @@ and evaluated using the same methodology developed for geological formation-top 
 ## References
 
 - UCI HAR dataset: https://archive.ics.uci.edu/dataset/240/human+activity+recognition+using+smartphones
+- Anguita et al. (2013). *A Public Domain Dataset for Human Activity Recognition Using Smartphones.* ESANN.
+- Nie et al. (2023). *A Time Series is Worth 64 Words: Long-Term Forecasting with Transformers (PatchTST).* ICLR.
+- Kim et al. (2022). *Reversible Instance Normalization for Accurate Time-Series Forecasting against Distribution Shift (RevIN).* ICLR.
+- Cui et al. (2019). *Class-Balanced Loss Based on Effective Number of Samples.* CVPR, 9268–9277.
+- Anthony, Kanding & Selvan (2020). *Carbontracker: Tracking and Predicting the Carbon Footprint of Training Deep Learning Models.* ICML Workshop on Challenges in Deploying and Monitoring ML Systems.
