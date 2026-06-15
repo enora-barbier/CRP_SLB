@@ -69,15 +69,22 @@ running from `Classification/`.
 ```
 datasets/medical/
 ├── README.md                 <- this file
-├── Classification/           <- the notebooks (see below)
+├── Classification/           <- sliding-window classification notebooks
+├── Transformer/              <- seq2seq transformer pipeline
+│   ├── seq2seq_transformer_data_split.ipynb
+│   └── uci_har_seq2seq.ipynb
 └── UCI HAR Dataset/          <- unzipped raw data
     ├── activity_labels.txt
     ├── features.txt
     ├── train/
-    │   ├── X_train.txt  y_train.txt  subject_train.txt
-    │   └── Inertial Signals/   <- the 9 raw channel files the notebooks read
+    │   ├── X_train.txt
+    │   ├── y_train.txt
+    │   ├── subject_train.txt
+    │   └── Inertial Signals/ <- the 9 raw sensor channels
     └── test/
-        ├── X_test.txt  y_test.txt  subject_test.txt
+        ├── X_test.txt
+        ├── y_test.txt
+        ├── subject_test.txt
         └── Inertial Signals/
 ```
 
@@ -106,6 +113,22 @@ All live in `Classification/`. Run in this order:
 `har_transition/`, `har_seq/`, `models_medical/`, `models_medical_carbon/`,
 `carbon_logs_medical/`, and any `*.npz` / `*.pth`. The small `experiment_log_*.csv` result
 logs are not ignored and may be committed if you want to share results.
+
+## Transformer Pipeline
+
+The `Transformer/` folder contains the sequence-to-sequence transformer implementation
+used to evaluate whether a modern time-series transformer can solve the transition-detection
+task directly, without sliding-window classification.
+
+| File | Description |
+|--------|-------------|
+| `seq2seq_transformer_data_split.ipynb` | Converts the raw UCI HAR data into subject-level train/validation/test splits and generates the sequence-to-sequence datasets used by the transformer. |
+| `uci_har_seq2seq.ipynb` | Trains and evaluates a PatchTST-based sequence-to-sequence transformer on the generated splits. Produces dense activity predictions and transition-detection metrics analogous to the North Sea formation-top task. |
+
+The transformer treats activity recognition as a dense sequence-labelling problem rather
+than independent window classification. Each timestep is assigned either a background
+(`None`) label or one of the six activities, allowing transition locations to be extracted
+and evaluated using the same methodology developed for geological formation-top detection.
 
 ## References
 
