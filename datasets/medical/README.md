@@ -110,4 +110,3 @@ logs are not ignored and may be committed if you want to share results.
 ## References
 
 - UCI HAR dataset: https://archive.ics.uci.edu/dataset/240/human+activity+recognition+using+smartphones
-- Task framing mirrors the North Sea formation-top pipeline (see the repo-root notebooks).
