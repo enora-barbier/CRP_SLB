@@ -371,7 +371,9 @@ def fuse(s1_preds: np.ndarray, embs: np.ndarray, score: np.ndarray,
 
 
 # ── Repeat loop: for each architecture, N_REPEATS independent runs ─────────────
-H = 128; EPOCHS = 15; LR = 0.001
+# EPOCHS is overridable so both GCP runs (15 and 30 epochs) reproduce without
+# editing code, e.g. EPOCHS=30 CKPT_DIR=... python gnn_stage2_anomaly_har.py
+H = 128; EPOCHS = int(os.environ.get("EPOCHS", "15")); LR = 0.001
 
 # ARCHS_OVERRIDE lets you resume a subset (e.g. just the remaining seeds of
 # one architecture) without needing BASE_SEED/N_REPEATS to apply identically
