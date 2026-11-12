@@ -745,39 +745,41 @@ if __name__ == "__main__":
     reset_seeds(42)
 
     # Load data
-    df_log = pd.read_parquet("data/Training/logs.parquet",
-                             engine="fastparquet")
+    df_log = pd.read_parquet("/Users/fokia/CRP_SLB/datasets/colorado/data/data/Training/logs.parquet")
     df_log.loc[df_log["GR"] < -1, "GR"] = -1
-    df_loc = pd.read_parquet("data/Training/loc.parquet",
-                             engine="fastparquet").reset_index()
-    df_log = df_loc.merge(df_log, on="wellName")
+    df_loc = pd.read_parquet("/Users/fokia/CRP_SLB/datasets/colorado/data/data/Training/loc.parquet",
+                                ).reset_index()
+    df_loc['wellName'] = df_loc['wellName'].astype(str).str.replace('.0', '', regex=False).str.strip()
+    df_log['wellName'] = df_log['wellName'].astype(str).str.replace('.0', '', regex=False).str.strip()
 
-    df_tops = pd.read_parquet("data/Training/tops.parquet",
-                              engine="fastparquet").set_index("well_name")
+    df_log = df_loc.merge(df_log, on="wellName")
+    df_tops = pd.read_parquet("/Users/fokia/CRP_SLB/datasets/colorado/data/data/Training/tops.parquet",
+                              ).set_index("well_name")
     top_cols = ["NIOBARA", "CODELL", "FORT_HAYS"]
     df_tops = df_tops[top_cols].dropna()
+    df_tops.index = df_tops.index.astype(str).str.replace('.0', '', regex=False).str.strip()
     
     #_loaded = np.load("data/Training/training_well_list.npy", allow_pickle=True)
     #training_well_array = [float(w) for w in _loaded[0, 0]]
 
-    df_valid_log = pd.read_parquet("data/testdata/logs_50.parquet",
-                                   engine="fastparquet")
+    df_valid_log = pd.read_parquet("/Users/fokia/CRP_SLB/datasets/colorado/data/data/test/logs_50.parquet",
+                                   )
     df_valid_log.loc[df_valid_log["GR"] < -1,  "GR"] = -1
     df_valid_log.loc[df_valid_log["GR"] > 400, "GR"] = 400
-    df_valid_loc = pd.read_parquet("data/testdata/loc_50.parquet",
-                                   engine="fastparquet").reset_index()
+    df_valid_loc = pd.read_parquet("/Users/fokia/CRP_SLB/datasets/colorado/data/data/test/loc_50.parquet",
+                                   ).reset_index()
     df_valid_log = df_valid_loc.merge(df_valid_log, on="wellName")
-    df_valid_tops = pd.read_csv("data/testdata/tops_50.csv"
+    df_valid_tops = pd.read_csv("/Users/fokia/CRP_SLB/datasets/colorado/data/data/test/tops_50.csv"
                                 ).set_index("wellName")[top_cols]
 
-    df_test_log = pd.read_parquet("data/testdata/logs_100.parquet",
-                                  engine="fastparquet")
+    df_test_log = pd.read_parquet("/Users/fokia/CRP_SLB/datasets/colorado/data/data/test/logs_100.parquet",
+                                  )
     df_test_log.loc[df_test_log["GR"] < -1,  "GR"] = -1
     df_test_log.loc[df_test_log["GR"] > 400, "GR"] = 400
-    df_test_loc = pd.read_parquet("data/testdata/loc_100.parquet",
-                                  engine="fastparquet").reset_index()
+    df_test_loc = pd.read_parquet("/Users/fokia/CRP_SLB/datasets/colorado/data/data/test/loc_100.parquet",
+                                  ).reset_index()
     df_test_log = df_test_loc.merge(df_test_log, on="wellName")
-    df_test_tops = pd.read_csv("data/testdata/tops_100.csv"
+    df_test_tops = pd.read_csv("/Users/fokia/CRP_SLB/datasets/colorado/data/data/test/tops_100.csv"
                                ).set_index("wellName")[top_cols]
     print(type(df_log["wellName"].iloc[0]))
     print(df_log["wellName"].iloc[0])
@@ -812,3 +814,8 @@ if __name__ == "__main__":
         top_cols   = top_cols,
         well_name  = str(df_test_tops.index[0]),
     )
+
+
+"""
+python /Users/fokia/CRP_SLB/datasets/colorado/Transformer/train.py
+"""

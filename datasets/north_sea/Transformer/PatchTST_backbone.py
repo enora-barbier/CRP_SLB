@@ -10,8 +10,12 @@ from torch import Tensor
 import torch.nn.functional as F
 import numpy as np
 #from collections import OrderedDict
-from .PatchTST_layers import *
-from .RevIN import RevIN
+try:
+    from .PatchTST_layers import *
+    from .RevIN import RevIN
+except ImportError:
+    from PatchTST_layers import *
+    from RevIN import RevIN
 
 from fastai.layers import Module
 

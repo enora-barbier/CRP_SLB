@@ -1,0 +1,21 @@
+stage,class,recall,precision,f1_score,support
+Stage1_only,ROGALAND,0.8632,0.3939,0.5409,354652
+Stage1_only,background,0.7086,0.7644,0.7355,670772
+Stage1_only,DUNLIN,0.5966,0.5808,0.5886,537810
+Stage1_only,SHETLAND,0.077,0.3926,0.1287,113515
+Stage1_only,HORDALAND,0.0147,0.3308,0.0281,288166
+Stage1_only,VESTLAND,0.0,0.0,0.0,21548
+Stage1_only,VIKING,0.0,0.0,0.0,0
+Stage1_Anomaly_Fusion,ROGALAND,0.8632,0.3939,0.5409,354652
+Stage1_Anomaly_Fusion,background,0.7086,0.7644,0.7355,670772
+Stage1_Anomaly_Fusion,DUNLIN,0.5966,0.5808,0.5886,537810
+Stage1_Anomaly_Fusion,SHETLAND,0.077,0.3926,0.1287,113515
+Stage1_Anomaly_Fusion,HORDALAND,0.0147,0.3308,0.0281,288166
+Stage1_Anomaly_Fusion,VESTLAND,0.0,0.0,0.0,21548
+Stage1_Anomaly_Fusion,VIKING,0.0,0.0,0.0,0
+Stage1_only,macro avg,0.3229,0.3518,0.2888,1986463
+Stage1_only,weighted avg,0.5614,0.5561,0.5157,1986463
+Stage1_only,accuracy,,,0.5614,1986463
+Stage1_Anomaly_Fusion,macro avg,0.3229,0.3518,0.2888,1986463
+Stage1_Anomaly_Fusion,weighted avg,0.5614,0.5561,0.5157,1986463
+Stage1_Anomaly_Fusion,accuracy,,,0.5614,1986463
