@@ -57,12 +57,12 @@ north_sea/
 ├── notebooks/
 │   └── 01_preprocessing.ipynb            <- initial data cleaning / preprocessing
 ├── Classification/                       <- GeoXTS sliding-window baseline
-│   ├── combined_data_split.ipynb
-│   ├── experiment_training.ipynb
-│   ├── experiment_log__shard*.csv
-│   ├── sweep_results_combined.csv
-│   ├── depth/                            <- splits + warm state WITH depth feature
-│   └── no_depth/                         <- splits + warm state WITHOUT depth feature
+│   ├── combined_data_split.ipynb         <- data prep, well split, loss sweep
+│   ├── experiment_training.ipynb         <- feature-subset / lr sweep, sharded over 4 VMs
+│   ├── experiment_log__shard*.csv        <- results of experiment_training, one per VM
+│   ├── sweep_results_combined.csv        <- results of the loss sweep
+│   ├── depth/                            <- warm state for the dataset with Depth
+│   └── no_depth/                         <- warm state for the dataset without Depth
 ├── GNN/
 │   └── GNN_markers_north_sea.ipynb       <- GraphSAGE formation-top segmentation
 └── Transformer/                          <- seq2seq transformer pipeline
@@ -90,17 +90,52 @@ north_sea/
 
 ### Classification
 
-Contains the GeoXTS-based sliding-window classification pipeline used as the main baseline.
+The GeoXTS sliding-window classification pipeline, used as the main baseline. Each
+201-sample window of well logs is classified as one of the six markers (HORDALAND,
+ROGALAND, SHETLAND, VIKING, VESTLAND, DUNLIN) or `None`. Predicted tops are then scored
+with recall at a 50-unit depth tolerance, MAE and max error on the test wells.
 
 **Key files**
 
-- `combined_data_split.ipynb` – dataset construction and train/validation/test splits.
-- `experiment_training.ipynb` – training and hyperparameter sweep notebook.
-- `experiment_log__shard*.csv` – distributed experiment logs (one per machine/shard).
-- `sweep_results_combined.csv` – aggregated benchmark results.
-- `depth/`, `no_depth/` – the two feature regimes (with vs. without an explicit depth
-  channel); each holds its own `train/val/test.npz`, `warm_state*.json`, and warm
-  tops/parquet files.
+- `combined_data_split.ipynb` – builds the dataset and runs the loss sweep:
+  - merges the well logs with the tops and well locations, and scales the logs and lat/lon
+    with fixed bounds;
+  - fills gaps per well and drops wells missing a whole curve;
+  - splits wells 70/10/20 (train/val/test), stratified on which markers each well has;
+  - extracts the windows and saves them to `no_depth/` or `depth/` (set by `USE_DEPTH`);
+  - its last cells sweep 8 loss functions over the hybrid models (`LSTM_FCN`, `LSTM_XCM`,
+    `LSTM_2dCNN`).
+- `experiment_training.ipynb` – the main experiment. It takes the best loss per model from
+  that sweep and tries it on 8 feature subsets with a fixed lr and with lr_find, on both
+  datasets. The runs are split across 4 VMs with `MY_SHARD` / `N_SHARDS`. A results
+  viewer merges the shard logs, and the last cells reload the best model and plot its
+  confusion matrix.
+- `sweep_results_combined.csv` – results of the loss sweep in `combined_data_split.ipynb`.
+- `experiment_log__shard*.csv` – one log per VM from `experiment_training.ipynb`, one row
+  per run with its settings, recall, MAE, max error and timings.
+- `no_depth/warm_state.json`, `depth/warm_state_depth.json` – the test wells, well-name
+  mapping, markers and feature list of each dataset. The `.npz` windows and
+  `warm_*.parquet` files go in the same folders, but they are too large for the repo, so
+  they are rebuilt with `combined_data_split.ipynb`.
+
+**How to run**
+
+Run both notebooks from inside `Classification/`, since all paths are relative to the
+working directory.
+
+1. Put the NPD export in `Classification/Data_NPD/`:
+   - `npd_welllogs/`, one parquet per well;
+   - `npd_welllogs_combined.parquet`;
+   - `npd_metadata/tops_conditioned_corr.csv`.
+2. Run `combined_data_split.ipynb` twice, once with `USE_DEPTH = False` and once with
+   `USE_DEPTH = True`, to fill `no_depth/` and `depth/`. Stop before the loss-sweep cells
+   if you only need the data.
+3. On each VM, set `MY_SHARD` in `experiment_training.ipynb` and run all cells. Models go
+   to `models/` and results to `experiment_log__shard{MY_SHARD}.csv`.
+4. Copy all shard CSVs into one folder and run the results viewer.
+
+Training is deterministic (fixed seed, deterministic CUDA). On a GPU this needs
+`CUBLAS_WORKSPACE_CONFIG`, which the notebooks set themselves.
 
 ### GNN
 
