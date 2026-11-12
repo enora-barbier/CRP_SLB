@@ -30,3 +30,5 @@ datasets/north_sea/Classification/no_depth/warm_df_test_g.parquet
 # OS
 .DS_Store
 Thumbs.db
+.claude/worktrees/
+.claude/settings.local.json
