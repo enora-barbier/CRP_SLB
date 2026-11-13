@@ -9,7 +9,6 @@ from torch import nn
 from torch import Tensor
 import torch.nn.functional as F
 import numpy as np
-#from collections import OrderedDict
 try:
     from .PatchTST_layers import *
     from .RevIN import RevIN
@@ -68,20 +67,13 @@ class PatchTST_backbone(Module):
     
     def forward(self, z, output_attentions: bool = False):                                                                   # z: [bs x nvars x seq_len]
          
-        #print("initial z = ,",z.cpu().detach().numpy())
         # norm
-        ##print("first batch z = " , z[0].cpu().detach().numpy())
-        ###print("z after revin = ,",z.cpu().detach().numpy())
-        ###print(z.shape)
 
         # do patching
         if self.padding_patch == 'end':
             x = self.padding_patch_layer(z)
-        ###print(z.shape)
         x = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)                   # z: [bs x nvars x patch_num x patch_len]
         x = x.permute(0,1,3,2)      
-        ###print("just before backbone call")                                                        # z: [bs x nvars x patch_len x patch_num]
-        ###print(z.shape)
 
         #masking patches
         if self.key_padding_mask=="auto":
@@ -93,27 +85,19 @@ class PatchTST_backbone(Module):
             z = z.permute(0,2,1)
             z = self.revin_layer(z, 'norm')
             z = z.permute(0,2,1)
-        #print("z after revin = ,",z.cpu().detach().numpy())
-        ###print(z.shape)
 
         # add padding to last patch if necessary
         if self.padding_patch == 'end':
             z = self.padding_patch_layer(z)
-        ###print(z.shape)
         z= z.unfold(dimension=-1, size=self.patch_len, step=self.stride)                   # z: [bs x nvars x patch_num x patch_len]
         z = z.permute(0,1,3,2) 
 
-        ###print("key padding masking in patchtst_backbone forward = ",key_padding_mask_tensor)
         # model
         z = self.backbone(z,key_padding_mask_tensor=key_padding_mask_tensor,output_attentions=output_attentions)                # z: [bs x nvars x d_model x patch_num]
         
-        ###print("z after backbone : ",z.shape)
-        ##print("from patchtst backbone, z = ",z)
         if output_attentions:
             z,attn = z
-        #print("z after backbone = ,",z.cpu().detach().numpy())
         z = self.head(z)                                                                    # z: [bs x nvars x target_window] 
-        ####print("z after head : ",z.shape)
         z = z [:,0,:,:]  # z: [bs x nvars x target_window] 
         # denorm
         if self.revin: 
@@ -148,11 +132,8 @@ class PatchTST_backbone(Module):
             mask_expanded = mask.unsqueeze(1).unsqueeze(2).expand(bs, n_vars, patch_len, patch_num)
             x = x.masked_fill(mask_expanded, 0.0)
 
-            # 5. Return
             if mask.any():
                 # Return mask: [bs, patch_num]
-                # Note: If your backbone later flattens Batch*Vars, you might need  to repeat this mask. 
-                # But usually, broadcasting handles it. The backbone flattens [Batch, Vars] -> [Batch*Vars]
 
                 # [bs, patch_num] -> [bs, n_vars, patch_num]
                 mask_expanded = mask.unsqueeze(1).repeat(1, n_vars, 1)
@@ -223,7 +204,6 @@ class TSTiEncoder(Module):  #i means channel-independent
         self.patch_len = patch_len
 
         # Initialize RoPE embeddings
-        #self.rope_embeddings = RoPEEmbeddings(d_model)
         
         # Input encoding
         q_len = patch_num
@@ -247,8 +227,6 @@ class TSTiEncoder(Module):  #i means channel-independent
                             )
     def forward(self, x, key_padding_mask_tensor, output_attentions:bool = False) -> Tensor:                                              # x: [bs x nvars x patch_len x patch_num]
         
-        ##print("tsti encoder, is input nan ? : ",x.isnan().any())
-        ###print(x.shape)
         n_vars = x.shape[1]
         # Input encoding
         x = x.permute(0,1,3,2)                                                   # x: [bs x nvars x patch_num x patch_len]
@@ -256,22 +234,16 @@ class TSTiEncoder(Module):  #i means channel-independent
 
         u = torch.reshape(x, (x.shape[0]*x.shape[1],x.shape[2],x.shape[3]))      # u: [bs * nvars x patch_num x d_model]
         u = self.dropout(u + self.W_pos)                                         # u: [bs * nvars x patch_num x d_model]
-        #print("z after droput = ,",u.cpu().detach().numpy())
         # Encoder
-        ###print("key_padding_mask_tensor = ",key_padding_mask_tensor)
         
         z = self.encoder((u,key_padding_mask_tensor,output_attentions))          # z: [bs * nvars x patch_num x d_model]
         
         if output_attentions:
             z,attn=z
-        #print("z after encoder = ,",z.cpu().detach().numpy())
         z = self.classification_head(z) #classification
-        ##print("z = ",z)
         z = torch.reshape(z, (-1,n_vars,z.shape[-2],z.shape[-1]))                # z: [bs x nvars x patch_num x d_model]
         z = z.permute(0,1,3,2)                                                   # z: [bs x nvars x d_model x patch_num]
         if output_attentions:
-            #print("z = ",z)
-            #print("attn = ",attn)
             return z,attn
         else:
             return z    
@@ -293,21 +265,14 @@ class TSTEncoder(Module):
         
         if len(src)==3:
             src, key_padding_mask_tensor,output_attentions = src
-            # #print("src = ",src)
-            # #print("key padding mask tensor = ",key_padding_mask_tensor)
-            # #print("output attention = ",output_attentions)
         else:
             src,key_padding_mask_tensor=src
             output_attentions = False
-        ##print("tst encoder, is input nan ? : ",src.isnan().any())
-        ###print("tstencodere here")
         output = src
         scores = None
-        ##print("self res attention = ",self.res_attention)
         if self.res_attention or output_attentions:
             for mod in self.layers: 
                 output, scores = mod(output, prev=scores, key_padding_mask_tensor=key_padding_mask_tensor, attn_mask=attn_mask,output_attentions=output_attentions)
-                #print("z after mod = ,",output.cpu().detach().numpy())
             if output_attentions:
                 return output,scores
             else:
@@ -357,15 +322,12 @@ class TSTEncoderLayer(Module):
 
 
     def forward(self, src:Tensor, key_padding_mask_tensor:Optional[Tensor]=None, prev:Optional[Tensor]=None, attn_mask:Optional[Tensor]=None, output_attentions: bool = False) -> Tensor:
-        ##print("tstencoder layer , is input nan ? : ",src.isnan().any())
         # Multi-Head attention sublayer
         if self.pre_norm:
             src = self.norm_attn(src)
         ## Multi-Head attention
         if self.res_attention or output_attentions:
-            ##print("src any nan ",src.isnan().any())
             src2, attn, scores = self.self_attn(src, src, src, prev, key_padding_mask_tensor=key_padding_mask_tensor, attn_mask=attn_mask,output_attentions=output_attentions)
-            ##print("attn any nan ", attn.isnan().any())
         else:
             src2, attn = self.self_attn(src, src, src, key_padding_mask_tensor=key_padding_mask_tensor, attn_mask=attn_mask)
 
@@ -373,7 +335,6 @@ class TSTEncoderLayer(Module):
             self.attn = attn
         ## Add & Norm
         src = src + self.dropout_attn(src2) # Add: residual connection with residual dropout
-        #print("z after self_attn = ,",src2.cpu().detach().numpy())
         if not self.pre_norm:
             src = self.norm_attn(src)
 
@@ -515,16 +476,12 @@ class _ScaledDotProductAttention(Module):
             attn   : [bs x n_heads x q_len x seq_len]
             scores : [bs x n_heads x q_len x seq_len]
         '''
-        ##print("scaled dot product attention, is input nan ? : ",q.isnan().any())
         # Scaled MatMul (q, k) - similarity scores for all pairs of positions in an input sequence
         attn_scores = torch.matmul(q, k) * self.scale      # attn_scores : [bs x n_heads x max_q_len x q_len]
 
-        # if attn_scores.isnan().any():
-        #     assert True==False
 
         # Add pre-softmax attention scores from the previous layer (optional)
         if prev is not None: 
-            ##print("prev is not None")
             attn_scores = attn_scores + prev
 
         # Attention mask (optional)
@@ -534,33 +491,14 @@ class _ScaledDotProductAttention(Module):
             else:
                 attn_scores += attn_mask
 
-        # if attn_scores.isnan().any():
-        #     assert True==False
 
-        ###print("new attn_scores contains nan= ",attn_scores.isnan().any())
         # Key padding mask (optional)
         if key_padding_mask_tensor is not None:                              # mask with shape [bs x q_len] (only when max_w_len == q_len)
-            ##print("testing masking mechanism from pytorch")
-            #key_padding_mask_tensor = key_padding_mask_tensor.view(key_padding_mask_tensor.shape[0], 1, 1, key_padding_mask_tensor.shape[1]).expand(-1, self.n_heads, -1, -1)
             key_padding_mask_tensor = key_padding_mask_tensor.unsqueeze(1).unsqueeze(2).repeat(1,1,key_padding_mask_tensor.shape[1],1)
-            #print("key_padding_mask_tensor = ,",key_padding_mask_tensor.cpu().detach().numpy())
             attn_scores.masked_fill_(key_padding_mask_tensor, -np.inf)
-        ##print("after masking attn_scores contains nan= ",attn_scores.isnan().any())
-        ##print("before softmax, attn_scores = ",attn_scores.cpu().detach().numpy())
         # normalize the attention weights
-        #print("attn_scores before softmax = ,",attn_scores.cpu().detach().numpy())
         attn_weights = F.softmax(attn_scores, dim=-1)                 # attn_weights   : [bs x n_heads x max_q_len x q_len]
-        ##print("after softmax contains nan= ",attn_weights.isnan().any())
-        #print("attn_scores after softmax = ,",attn_scores.cpu().detach().numpy())
         attn_weights = self.attn_dropout(attn_weights)
-        ##plot attention map
-        # import matplotlib.pyplot as plt
-        # att_map = attn_scores[0]
-        # att_map_norm = torch.mean(att_map,dim=0).cpu().detach().numpy()
-        # plt.imshow(att_map_norm, interpolation='none')
-        # plt.show()
-        #assert True==False
-        ##print("after dropout attn_weights contains nan= ",attn_weights.isnan().any())
         # compute the new values given the attention weights
         output = torch.matmul(attn_weights, v)                        # output: [bs x n_heads x max_q_len x d_v]
 
