@@ -134,12 +134,10 @@ class RoPEEmbeddings(nn.Module):
         self.register_buffer('inv_freq', inv_freq)
 
     def forward(self, x):
-        # print(f"x shape: {x.shape}")
         seq_len = x.size(-2)  # Adjusted to match the sequence length dimension
         pos = torch.arange(seq_len, dtype=torch.float, device=x.device)
         sinusoid_inp = torch.einsum('i,j->ij', pos, self.inv_freq)
         pos_emb = torch.cat([sinusoid_inp.sin(), sinusoid_inp.cos()], dim=-1)
-        # print(f"pos_emb shape before adjustment: {pos_emb.shape}")
 
         # Adjust pos_emb to match the dimensions of x
         if x.size(-1) == pos_emb.size(-1):
@@ -150,20 +148,13 @@ class RoPEEmbeddings(nn.Module):
             pos = torch.arange(seq_len, dtype=torch.float, device=x.device)
             sinusoid_inp = torch.einsum('i,j->ij', pos, self.inv_freq)
             pos_emb = torch.cat([sinusoid_inp.sin(), sinusoid_inp.cos()], dim=-1)
-            # pos_emb = pos_emb.reshape()
-            # print(f"regenerated positional embedding: {pos_emb.shape}")
             pos_emb = pos_emb.T.unsqueeze(0).unsqueeze(0).expand(x.size(0), x.size(1), x.size(2),-1)
         
-        # print(f"pos_emb shape after adjustment: {pos_emb.shape}")
         return self.apply_rotary_pos_emb(x, pos_emb)
 
     def apply_rotary_pos_emb(self, x, pos_emb):
         x1, x2 = x[..., :self.dim // 2], x[..., self.dim // 2:]
         pos_emb1, pos_emb2 = pos_emb[..., :self.dim // 2], pos_emb[..., self.dim // 2:]
-        # print(f"x1 shape: {x1.shape}")
-        # print(f"x2 shape: {x2.shape}")
-        # print(f"pos_emb1 shape: {pos_emb1.shape}")
-        # print(f"pos_emb2 shape: {pos_emb2.shape}")
         
         return torch.cat([x1 * pos_emb1.cos() - x1 * pos_emb1.sin(),
                           x2 * pos_emb2.sin() + x2 * pos_emb2.cos()], dim=-1)

@@ -1,6 +1,6 @@
 """
-PatchTST Well Log Segmentation Pipelines
-=================================================================
+PatchTST well-log segmentation for Colorado
+
 Input  : GR log resampled to a fixed length  (bs, 1, seq_len)
 Output : zone label at every depth point     (bs, seq_len)
 Loss   : Cross-entropy
@@ -32,20 +32,16 @@ def reset_seeds(seed=42):
 
 
 
-# ---------------------------------------------------------------------------
-# 1.  DATASET
-# ---------------------------------------------------------------------------
-
 class WellLogDataset(Dataset):
     """
     Each sample is one well:
-        X : float32  (1, seq_len)   – resampled GR log
-        y : int64    (seq_len,)     – zone label per depth point  (tops_seq)
+        X : float32  (1, seq_len)   resampled GR log
+        y : int64    (seq_len,)     zone label per depth point
     """
     def __init__(self, X: np.ndarray, y: np.ndarray):
         # X: (n_wells, seq_len)  or  (n_wells, 1, seq_len)
         if X.ndim == 2:
-            X = X[:, np.newaxis, :]          # → (n_wells, 1, seq_len)
+            X = X[:, np.newaxis, :]          # (n_wells, 1, seq_len)
         self.X = torch.from_numpy(X.astype(np.float32))
         self.y = torch.from_numpy(y.astype(np.int64))
 
@@ -56,13 +52,9 @@ class WellLogDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 
-# ---------------------------------------------------------------------------
-# 2.  SEGMENTATION HEAD
-# ---------------------------------------------------------------------------
-
 class SegmentationHead(nn.Module):
     """
-    Maps backbone output → per-depth-point class logits.
+    Maps backbone output to class logits at every depth point.
 
     Backbone (TSTiEncoder + classification_head) outputs:
         (bs, n_vars, n_markers+2, patch_num)
@@ -100,16 +92,12 @@ class SegmentationHead(nn.Module):
         return z
 
 
-# ---------------------------------------------------------------------------
-# 3.  FULL MODEL
-# ---------------------------------------------------------------------------
-
 class PatchTSTSegmenter(nn.Module):
     """
     PatchTST backbone + segmentation head for well-log zone prediction.
 
-    Input  : (bs, 1, seq_len)   – GR log
-    Output : (bs, seq_len, n_classes)  – logits per depth point
+    Input  : (bs, 1, seq_len)   GR log
+    Output : (bs, seq_len, n_classes)  logits per depth point
     """
     def __init__(
         self,
@@ -132,8 +120,7 @@ class PatchTSTSegmenter(nn.Module):
         patch_num = int((seq_len - patch_len) / stride + 1) + 1  # +1 for 'end' pad
         head_nf   = (n_markers + 2) * patch_num
 
-        # backbone with a dummy target_window – its Flatten_Head is NOT used;
-        # we bypass it with our own SegmentationHead below
+        # target_window is a placeholder, the backbone's Flatten_Head is replaced by SegmentationHead below
         self.backbone = PatchTST_backbone(
             c_in           = 1,
             context_window = seq_len,
@@ -151,7 +138,7 @@ class PatchTSTSegmenter(nn.Module):
             head_dropout   = head_dropout,
             head_type      = "flatten",
             individual     = False,
-            revin          = False,       # as requested
+            revin          = False,
             padding_patch  = "end",
             pe             = "zeros",
             learn_pe       = True,
@@ -160,10 +147,8 @@ class PatchTSTSegmenter(nn.Module):
             alibi          = False,
         )
 
-        # Remove the backbone's own head – we only want the encoder features
-        # The backbone's TSTiEncoder already applies the classification_head
-        # which maps d_model → (n_markers+2), so backbone output is
-        # (bs, n_vars, n_markers+2, patch_num)  i.e. head_nf per var
+        # drop the backbone's own head. Its TSTiEncoder already maps d_model to n_markers+2,
+        # so the encoder output is (bs, n_vars, n_markers+2, patch_num)
         del self.backbone.head
 
         self.seg_head = SegmentationHead(
@@ -179,7 +164,6 @@ class PatchTSTSegmenter(nn.Module):
         x : (bs, 1, seq_len)
         returns logits : (bs, seq_len, n_classes)
         """
-        # Run backbone up to (just before) its head
         z = self._encode(x)       # (bs, 1, n_markers+2, patch_num)
         return self.seg_head(z)   # (bs, seq_len, n_classes)
 
@@ -206,19 +190,14 @@ class PatchTSTSegmenter(nn.Module):
 
         z = torch.nan_to_num(z)
 
-        # backbone encoder  (TSTiEncoder)
+        # TSTiEncoder
         z = b.backbone(z, key_padding_mask_tensor=kpm)  # (bs,1,n_markers+2,patch_num)
         return z
 
 
-# ---------------------------------------------------------------------------
-# 4.  DATA PREPARATION
-# ---------------------------------------------------------------------------
-
 def build_tops_seq(depth_arr: np.ndarray, top_depths: np.ndarray) -> np.ndarray:
     """
-    Build a 1-D integer zone-label array matching tops_seq from
-    generate_sequences_resampling_markers.
+    Build a 1-D integer zone-label array from the top depths.
 
     zone 0 = above first top
     zone k = between top k-1 and top k
@@ -254,12 +233,10 @@ def prepare_sequences(
     Resample every well's GR log to a regular depth grid (srate ft spacing),
     build the zone-label sequence, and pad to the same length.
 
-    Mirrors generate_sequences_resampling_markers logic from the screenshot.
-
     Returns
     -------
-    X          : float32  (n_wells, seq_len)   – resampled GR
-    y          : int64    (n_wells, seq_len)   – zone labels (tops_seq)
+    X          : float32  (n_wells, seq_len)   resampled GR
+    y          : int64    (n_wells, seq_len)   zone labels
     depth_axes : list of 1-D depth arrays, one per well (before padding)
     """
     wells = well_list if (well_list is not None and len(well_list) > 0) \
@@ -287,7 +264,7 @@ def prepare_sequences(
         gr_resampled = np.interp(depth_grid, depth_raw, gr_raw).astype(np.float32)
 
         top_depths = df_tops.loc[well, top_cols].values.astype(float)
-        # Crop to tops region
+        # crop to the true tops ± 500 ft, also applied to validation and test wells
         depth_grid, gr_resampled = crop_to_tops_region(
             depth_grid, gr_resampled, top_depths, margin_ft=500.0
         )
@@ -305,17 +282,13 @@ def prepare_sequences(
     for i, (gr, lbl) in enumerate(zip(all_gr, all_labels)):
         X[i, :len(gr)] = gr
         y[i, :len(lbl)] = lbl
-        # pad label with last valid label (not 0) to avoid loss on padding
+        # padding gets the last zone label, so it still counts in the loss and accuracy
         y[i, len(lbl):] = lbl[-1]
 
     print(f"Prepared {len(wells)} wells  |  seq_len={seq_len}  |  "
           f"n_classes={len(top_cols)+1}")
     return X, y, depth_axes
 
-
-# ---------------------------------------------------------------------------
-# 5.  TRAINING
-# ---------------------------------------------------------------------------
 
 def train_one_epoch(model, loader, optimiser, device, class_weights=None):
     model.train()
@@ -412,10 +385,6 @@ def train(
     return model
 
 
-# ---------------------------------------------------------------------------
-# 6.  INFERENCE
-# ---------------------------------------------------------------------------
-
 def enforce_monotonic(zone_preds: np.ndarray) -> np.ndarray:
     """Force the step function to be non-decreasing with depth."""
     out = zone_preds.copy()
@@ -463,10 +432,6 @@ def predict(
     return results
 
 
-# ---------------------------------------------------------------------------
-# 7.  EVALUATION  –  top-depth picking accuracy
-# ---------------------------------------------------------------------------
-
 def top_depths_from_step_function(
     depth_arr:  np.ndarray,
     zone_preds: np.ndarray,
@@ -474,7 +439,7 @@ def top_depths_from_step_function(
 ) -> np.ndarray:
     """
     Recover predicted top depths from the step function.
-    Top k = first depth where zone label transitions from k-1 → k.
+    Top k = first depth where the zone label goes from k-1 to k.
     """
     est = []
     for k in range(1, n_tops + 1):
@@ -558,10 +523,6 @@ def evaluate_segmentation_metrics(
     return accuracy
 
 
-# ---------------------------------------------------------------------------
-# 8.  VISUALISATION
-# ---------------------------------------------------------------------------
-
 def plot_prediction(
     df_result:  pd.DataFrame,
     df_tops:    Optional[pd.DataFrame] = None,
@@ -614,12 +575,8 @@ def plot_prediction(
     plt.show()
 
 
-# ---------------------------------------------------------------------------
-# 9.  MAIN PIPELINE  (drop-in replacement for existing notebook cells)
-# ---------------------------------------------------------------------------
-
 def run_pipeline(
-    # --- data ---
+    # data
     df_log_train:         pd.DataFrame,
     df_tops_train:        pd.DataFrame,
     training_well_array:  np.ndarray,
@@ -628,10 +585,10 @@ def run_pipeline(
     df_log_test:          Optional[pd.DataFrame] = None,
     df_tops_test:         Optional[pd.DataFrame] = None,
     top_cols:             Optional[List[str]]    = None,
-    # --- resampling ---
+    # resampling
     srate:                float = 4.0,
     gr_clip:              Tuple[float, float] = (-1.0, 400.0),
-    # --- model ---
+    # model
     patch_len:            int   = 16,
     stride:               int   = 8,
     d_model:              int   = 128,
@@ -640,7 +597,7 @@ def run_pipeline(
     d_ff:                 int   = 256,
     n_markers:            int   = 0,
     dropout:              float = 0.1,
-    # --- training ---
+    # training
     epochs:               int   = 30,
     batch_size:           int   = 16,
     lr:                   float = 1e-4,
@@ -659,7 +616,7 @@ def run_pipeline(
         top_cols = list(df_tops_train.columns)
     n_classes = len(top_cols) + 1
 
-    # ── 1. Prepare sequences ──────────────────────────────────────────────
+    # prepare sequences
     print("Preparing training sequences …")
     X_train, y_train, _ = prepare_sequences(
         df_log_train, df_tops_train, top_cols, srate, gr_clip,
@@ -685,7 +642,7 @@ def run_pipeline(
     X_train, y_train = pad_to(X_train, y_train, seq_len)
     X_valid, y_valid = pad_to(X_valid, y_valid, seq_len)
 
-    # ── 2. Build model ────────────────────────────────────────────────────
+    # build model
     print(f"\nBuilding PatchTSTSegmenter  seq_len={seq_len}  n_classes={n_classes}")
     model = PatchTSTSegmenter(
         seq_len   = seq_len,
@@ -700,13 +657,13 @@ def run_pipeline(
         dropout   = dropout,
     )
 
-    # ── 3. Train ──────────────────────────────────────────────────────────
+    # train
     model = train(
         model, X_train, y_train, X_valid, y_valid,
         epochs=epochs, batch_size=batch_size, lr=lr, save_path=save_path,
     )
 
-    # ── 4. Inference on test set ──────────────────────────────────────────
+    # inference on test set
     df_log_inf  = df_log_test  if df_log_test  is not None else df_log_valid
     df_tops_inf = df_tops_test if df_tops_test is not None else df_tops_valid
 
@@ -725,17 +682,13 @@ def run_pipeline(
     print("Running inference …")
     results = predict(model, X_test, depth_axes_test, batch_size=batch_size)
 
-    # ── 5. Evaluate ───────────────────────────────────────────────────────
+    # evaluate
     df_eval = evaluate_top_picking(results, test_wells, df_tops_inf, top_cols)
     evaluate_segmentation_metrics(
     results, test_wells, df_tops_inf, top_cols)
 
     return model, results, df_eval
 
-
-# ---------------------------------------------------------------------------
-# EXAMPLE USAGE  (mirrors existing notebook)
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     if os.path.exists("patchtst_seg.pt"):
@@ -744,7 +697,6 @@ if __name__ == "__main__":
 
     reset_seeds(42)
 
-    # Load data
     df_log = pd.read_parquet("/Users/fokia/CRP_SLB/datasets/colorado/data/data/Training/logs.parquet")
     df_log.loc[df_log["GR"] < -1, "GR"] = -1
     df_loc = pd.read_parquet("/Users/fokia/CRP_SLB/datasets/colorado/data/data/Training/loc.parquet",
@@ -759,8 +711,6 @@ if __name__ == "__main__":
     df_tops = df_tops[top_cols].dropna()
     df_tops.index = df_tops.index.astype(str).str.replace('.0', '', regex=False).str.strip()
     
-    #_loaded = np.load("data/Training/training_well_list.npy", allow_pickle=True)
-    #training_well_array = [float(w) for w in _loaded[0, 0]]
 
     df_valid_log = pd.read_parquet("/Users/fokia/CRP_SLB/datasets/colorado/data/data/test/logs_50.parquet",
                                    )
@@ -784,7 +734,6 @@ if __name__ == "__main__":
     print(type(df_log["wellName"].iloc[0]))
     print(df_log["wellName"].iloc[0])
 
-    # Run pipeline
     model, results, df_eval = run_pipeline(
         df_log_train        = df_log,
         df_tops_train       = df_tops,
@@ -814,8 +763,3 @@ if __name__ == "__main__":
         top_cols   = top_cols,
         well_name  = str(df_test_tops.index[0]),
     )
-
-
-"""
-python /Users/fokia/CRP_SLB/datasets/colorado/Transformer/train.py
-"""

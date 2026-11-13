@@ -9,7 +9,6 @@ from torch import nn
 from torch import Tensor
 import torch.nn.functional as F
 import numpy as np
-#from collections import OrderedDict
 from PatchTST_layers import *
 from RevIN import RevIN
 
@@ -51,7 +50,6 @@ class PatchTST_backbone(Module):
 
         # Head
         self.n_markers = n_markers 
-        #self.head_nf = d_model * patch_num
         self.head_nf = (n_markers + 2) * patch_num
         self.n_vars = c_in
         self.pretrain_head = pretrain_head
@@ -113,7 +111,6 @@ class PatchTST_backbone(Module):
         print("z after backbone = ,",z.cpu().detach().numpy())
         z = self.head(z)                                                                    # z: [bs x nvars x target_window] 
         print("z after head : ",z.shape)
-        #z = z [:,0,:,:]  # z: [bs x nvars x target_window] 
         # denorm
         if self.revin: 
             z = z.permute(0,2,1)
@@ -147,11 +144,8 @@ class PatchTST_backbone(Module):
             mask_expanded = mask.unsqueeze(1).unsqueeze(2).expand(bs, n_vars, patch_len, patch_num)
             x = x.masked_fill(mask_expanded, 0.0)
 
-            # 5. Return
             if mask.any():
                 # Return mask: [bs, patch_num]
-                # Note: If your backbone later flattens Batch*Vars, you might need  to repeat this mask. 
-                # But usually, broadcasting handles it. The backbone flattens [Batch, Vars] -> [Batch*Vars]
 
                 # [bs, patch_num] -> [bs, n_vars, patch_num]
                 mask_expanded = mask.unsqueeze(1).repeat(1, n_vars, 1)
@@ -222,7 +216,6 @@ class TSTiEncoder(Module):  #i means channel-independent
         self.patch_len = patch_len
 
         # Initialize RoPE embeddings
-        #self.rope_embeddings = RoPEEmbeddings(d_model)
         
         # Input encoding
         q_len = patch_num
@@ -514,16 +507,12 @@ class _ScaledDotProductAttention(Module):
             attn   : [bs x n_heads x q_len x seq_len]
             scores : [bs x n_heads x q_len x seq_len]
         '''
-        ##print("scaled dot product attention, is input nan ? : ",q.isnan().any())
         # Scaled MatMul (q, k) - similarity scores for all pairs of positions in an input sequence
         attn_scores = torch.matmul(q, k) * self.scale      # attn_scores : [bs x n_heads x max_q_len x q_len]
 
-        # if attn_scores.isnan().any():
-        #     assert True==False
 
         # Add pre-softmax attention scores from the previous layer (optional)
         if prev is not None: 
-            ##print("prev is not None")
             attn_scores = attn_scores + prev
 
         # Attention mask (optional)
@@ -533,33 +522,18 @@ class _ScaledDotProductAttention(Module):
             else:
                 attn_scores += attn_mask
 
-        # if attn_scores.isnan().any():
-        #     assert True==False
 
         print("new attn_scores contains nan= ",attn_scores.isnan().any())
         # Key padding mask (optional)
         if key_padding_mask_tensor is not None:                              # mask with shape [bs x q_len] (only when max_w_len == q_len)
-            #print("testing masking mechanism from pytorch")
-            #key_padding_mask_tensor = key_padding_mask_tensor.view(key_padding_mask_tensor.shape[0], 1, 1, key_padding_mask_tensor.shape[1]).expand(-1, self.n_heads, -1, -1)
             key_padding_mask_tensor = key_padding_mask_tensor.unsqueeze(1).unsqueeze(2).repeat(1,1,key_padding_mask_tensor.shape[1],1)
-            #print("key_padding_mask_tensor = ,",key_padding_mask_tensor.cpu().detach().numpy())
             attn_scores.masked_fill_(key_padding_mask_tensor, -np.inf)
         print("after masking attn_scores contains nan= ",attn_scores.isnan().any())
         print("before softmax, attn_scores = ",attn_scores.cpu().detach().numpy())
         # normalize the attention weights
-        #print("attn_scores before softmax = ,",attn_scores.cpu().detach().numpy())
         attn_weights = F.softmax(attn_scores, dim=-1)                 # attn_weights   : [bs x n_heads x max_q_len x q_len]
         print("after softmax contains nan= ",attn_weights.isnan().any())
-        #print("attn_scores after softmax = ,",attn_scores.cpu().detach().numpy())
         attn_weights = self.attn_dropout(attn_weights)
-        ##plot attention map
-        # import matplotlib.pyplot as plt
-        # att_map = attn_scores[0]
-        # att_map_norm = torch.mean(att_map,dim=0).cpu().detach().numpy()
-        # plt.imshow(att_map_norm, interpolation='none')
-        # plt.show()
-        #assert True==False
-        ##print("after dropout attn_weights contains nan= ",attn_weights.isnan().any())
         # compute the new values given the attention weights
         output = torch.matmul(attn_weights, v)                        # output: [bs x n_heads x max_q_len x d_v]
 
