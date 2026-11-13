@@ -1,32 +1,27 @@
 """
-Computes transition_recall for every already-saved HAR checkpoint
-(stage1_har_{arch}_seed{N}.pt), matching the exact metric definition from
-experiment_training_medical.ipynb's evaluate_medical() -- the function used
-to compute transition_recall for the Sliding family (LSTM, LSTM-FCN,
-InceptionTime), which trains on the SAME curated har_transition/ dataset as
-this GNN (built by combined_data_split_medical.ipynb). Using that same
-definition keeps the GNN's number apples-to-apples with the Sliding family's
-already-reported numbers, rather than the different, uncurated-sequence-based
-metric used by the separate Seq2Seq/Transformer track.
+transition_recall for the saved HAR Stage 1 checkpoints
+(stage1_har_{arch}_seed{N}.pt).
 
-Definition (verbatim from evaluate_medical()):
-  transition_recall    = accuracy on true-transition windows (label > 0):
-                          of test windows whose TRUE label is a transition
-                          onset (not None), what fraction did the model
-                          classify with the exact correct activity?
-  transition_precision = of windows PREDICTED as a transition (pred > 0),
-                          fraction that actually are (true label > 0)
-  transition_f1        = harmonic mean of the above two
-  f1_transition_only   = macro-F1 on classes 1-6, evaluated on true-transition
-                          windows only (excludes None entirely)
-  median_error/max_class_error = median/max |pred_class - true_class| on
-                          true-transition windows (class-distance error)
+The metrics follow evaluate_medical() in experiment_training_medical.ipynb, which
+produces the Sliding-family numbers (LSTM, LSTM-FCN, InceptionTime). Those models
+train on the same curated har_transition/ data as the GNN (built by
+combined_data_split_medical.ipynb), so the results are comparable. They are not
+comparable to the Seq2Seq / Transformer transition recall, which is computed on
+uncurated sequences.
 
-No temporal order or raw UCI HAR signal files needed -- this runs directly
-against the existing (curated, shuffled) test.npz and the already-trained
-Stage 1 checkpoints.
+Metrics:
+  transition_recall    accuracy on windows whose true label is a transition (> 0):
+                       the share classified as exactly the right activity
+  transition_precision share of windows predicted as a transition (> 0) that truly
+                       are one
+  transition_f1        harmonic mean of the two
+  f1_transition_only   macro-F1 over classes 1-6, on true-transition windows only
+  median_error, max_class_error
+                       median / max of |predicted class - true class| on
+                       true-transition windows
 
-Run this on the VM: python3 recover_transition_recall_har.py
+Only the curated, shuffled test.npz and the checkpoints are needed, not the raw
+signals or any temporal order:  python3 recover_transition_recall_har.py
 """
 import os, re, glob, json
 from pathlib import Path
@@ -135,8 +130,7 @@ def full_preds(model, dl):
     return np.array(preds)
 
 def evaluate_medical(preds, trues, n_classes):
-    """Verbatim port of evaluate_medical()'s metric logic from
-    experiment_training_medical.ipynb (Sliding-family reference notebook)."""
+    """Port of the metric logic in evaluate_medical() from experiment_training_medical.ipynb."""
     true_trans_mask = trues > 0
     pred_trans_mask = preds > 0
 

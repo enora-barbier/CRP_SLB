@@ -1,16 +1,16 @@
 """
-Computes Recall@Tolerance(+/-50ft) for Stage 1 predictions, for every already-
-saved north_sea checkpoint (stage1_{arch}_seed{N}.pt), without needing the
-IsolationForest fusion step or any threshold from the (schema-drifted) CSV
-logs -- just reloads each checkpoint and runs Stage 1 inference once.
+Recall@Tolerance (+/-50 ft) for the saved North Sea Stage 1 checkpoints
+(stage1_{arch}_seed{N}.pt).
 
-Recall@Tolerance: a true formation-boundary (a depth where the label
-sequence changes value) counts as "found" if ANY predicted boundary in that
-well falls within +/- tolerance_ft of it. Recall = matched / total true
-boundaries, pooled across all wells for that (arch, seed).
+Each checkpoint is reloaded and run once. The Isolation Forest step and the CSV
+logs are not needed.
 
-Run this on the VM (needs log_valid.parquet/tops_valid.parquet + the
-checkpoints, both only there): python3 recover_boundary_recall.py
+A true boundary (a depth where the label sequence changes value) counts as found
+if any predicted boundary in the same well lies within the tolerance. Recall is
+matched / total true boundaries, pooled over all wells for each (arch, seed).
+
+Needs log_valid.parquet and tops_valid.parquet in the working directory and the
+checkpoints in CKPT_DIR:  python3 recover_boundary_recall.py
 """
 import os, re, glob
 from pathlib import Path
@@ -136,14 +136,15 @@ def predict_well(well, df_log, df_tops, stage1, smooth=11):
     return true_lbl, s1_pred, depths
 
 def boundary_depths(labels, depths, min_run_ft=15.0):
-    """Depths where the label sequence changes to a NEW value that then holds
-    stable for at least min_run_ft on both sides -- rejects single-sample
-    classification noise (a raw np.diff()!=0 edge detector would count every
-    flip in a noisy per-sample prediction sequence as a "boundary", which
-    makes a tolerance-window recall metric trivially easy to satisfy
-    regardless of real model quality)."""
+    """Depths where the label changes to a new value that then holds for at least
+    min_run_ft on both sides.
+
+    The run-length filter matters: counting every np.diff() != 0 edge would treat
+    each single-sample flip in a noisy prediction as a boundary, which makes the
+    tolerance-window recall trivially high whatever the model quality."""
     if len(labels) < 2:
         return np.array([])
+    # Split the sequence into runs of identical labels
     change_idx = np.where(np.diff(labels) != 0)[0] + 1
     run_starts = np.concatenate([[0], change_idx])
     run_ends   = np.concatenate([change_idx, [len(labels)]])

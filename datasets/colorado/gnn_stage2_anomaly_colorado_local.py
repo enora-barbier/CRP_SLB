@@ -1,23 +1,24 @@
 """
-Colorado — GNN Stage 1 + Stage 2 Anomaly Detection
-====================================================
-Direct adaptation of gnn_stage2_anomaly_shetland.py for the Colorado dataset,
-with carbon tracking upgraded to match north_sea/GNN/gnn_stage2_anomaly.py's
-methodology (dual CodeCarbon + CarbonTracker, train/inference measured
-separately, N_REPEATS independent runs for mean +/- std, grid-intensity
-audit, schema-drift-guarded CSV log).
+GNN + Isolation Forest formation-boundary detection on the Colorado wells.
 
-Differences vs North Sea:
-  Features  : GR + DEPTH_NORM only (2 features, GR_CLEAN via sentinel masking)
-  Markers   : NIOBARA, FORT_HAYS, CODELL  (3 formations, no background class --
-              every well is cropped to start at its shallowest known top)
-  Well col  : wellName  (float IDs)
-  Depth col : DEPTH
-  Splits    : 600 training wells split 80/20 → train/val; separate test set (50 or 100 wells)
+Same pipeline and carbon tracking as the North Sea script (CodeCarbon and
+CarbonTracker, training and evaluation measured separately, N_REPEATS seeds for
+mean +/- std).
 
-Stage 1 : GraphSAGE node-level classifier
-Stage 2 : Isolation Forest anomaly detection
-          Correction: per-well adaptive boundaries from confident Stage 1 predictions
+Differences from North Sea:
+  features : gamma ray (GR_CLEAN) and normalised depth only
+  markers  : NIOBARA, FORT_HAYS, CODELL. There is no background class: each well
+             is cropped to start at its shallowest known top.
+  well col : wellName
+  depth col: DEPTH
+  splits   : 600 training wells split 80/20 into train/val, plus a separate test set
+
+Stage 1: node-level GNN classifier (GraphSAGE or ImprovedGNN).
+Stage 2: Isolation Forest on the node embeddings; confident Stage 1 predictions
+         are used to correct boundaries per well.
+
+Environment variables: CKPT_DIR, OUT_DIR, N_REPEATS, BASE_SEED,
+ELECTRICITYMAPS_API_KEY.
 """
 
 import warnings, os, re, time, pickle, csv, socket, subprocess, uuid, random
@@ -43,19 +44,17 @@ import matplotlib.pyplot as plt
 from codecarbon import OfflineEmissionsTracker
 from carbontracker.tracker import CarbonTracker
 
-# Model + every DGL graph batch must be moved onto this device explicitly --
-# neither PyTorch nor DGL do it automatically, so without these .to(DEVICE)
-# calls everything silently runs on CPU even with a GPU present and detected
-# by CodeCarbon/CarbonTracker.
+# Models and graph batches are moved to this device explicitly with .to(DEVICE);
+# neither PyTorch nor DGL does it for you.
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 BASE_TRAIN = "./"
 BASE_TEST = "./"
 
-# Output / checkpoint root — default to /tmp locally, override for cloud storage
+# Checkpoints, logs and figures go under CKPT_DIR unless OUT_DIR is set.
 CKPT_DIR  = os.environ.get("CKPT_DIR",  "/tmp/colorado_stage2_ckpt")
-OUT_DIR   = os.environ.get("OUT_DIR",   CKPT_DIR)   # separate output dir if needed
+OUT_DIR   = os.environ.get("OUT_DIR",   CKPT_DIR)
 CARBON_DIR = Path(CKPT_DIR) / "carbon_logs"
 CONF_PATH = os.path.join(OUT_DIR, "colorado_stage2_confusion.png")
 CARBON_FIG_PATH = os.path.join(OUT_DIR, "colorado_stage2_carbon_charts.png")
@@ -79,13 +78,10 @@ try:
 except Exception:
     GIT_SHA = "unknown"
 
-# ── Carbon tracker configuration ────────────────────────────────────────────
-# Same convention as north_sea/GNN/gnn_stage2_anomaly.py and the LSTM carbon-
-# tracking notebook: CodeCarbon uses OfflineEmissionsTracker(country_iso_code
-# ="NOR") so the country is never auto-detected from the VM's outbound IP, and
-# CarbonTracker is pointed at the Electricity Maps API (key from env — never
-# hardcode it) for live Norwegian grid intensity. This is a project-wide
-# market-based accounting convention, not a claim about physical VM location.
+# Carbon accounting is pinned to Norway for the whole project, whatever the
+# physical location of the machine. CodeCarbon runs offline with an explicit
+# country code; CarbonTracker reads live grid intensity from Electricity Maps
+# when ELECTRICITYMAPS_API_KEY is set.
 CARBON_COUNTRY_ISO3 = "NOR"
 _ELECTRICITYMAPS_KEY = os.environ.get("ELECTRICITYMAPS_API_KEY")
 _ct_api_keys = {"electricitymaps": _ELECTRICITYMAPS_KEY} if _ELECTRICITYMAPS_KEY else None
@@ -94,14 +90,9 @@ if _ct_api_keys is None:
           "will fall back to its built-in average grid-intensity estimate instead of "
           "live data. Set the env var to match the notebook's methodology exactly.")
 
-# ── Force CarbonTracker's location to Norway ────────────────────────────────
-# carbontracker's IntensityService hardcodes geocoder.ip("me") for location
-# detection with NO override parameter anywhere in CarbonTracker's constructor
-# (verified against the installed carbontracker==2.4.4 source: intensity.py
-# always calls geocoder.ip("me")). On a cloud VM that resolves to wherever the
-# VM's outbound IP actually geolocates to, not this project's Norway
-# accounting convention — so the location lookup is monkey-patched here,
-# before any CarbonTracker is built.
+# CarbonTracker always geolocates the machine from its outbound IP (carbontracker
+# 2.4.4 has no override). Patch the lookup to return Norway before any tracker
+# is built.
 import types
 from carbontracker.emissions.intensity import intensity as _ct_intensity
 
@@ -112,10 +103,9 @@ def _forced_norway_location(self):
     )
 _ct_intensity.IntensityService._fetch_geo_location = _forced_norway_location
 
-# ── Add a timeout to CarbonTracker's Electricity Maps HTTP call ─────────────
-# ElectricityMap._carbon_intensity_by_location calls requests.get() with no
-# timeout, so an unresponsive API leaves the whole run hanging indefinitely
-# instead of falling back to the static average the code already supports.
+# CarbonTracker's Electricity Maps request has no timeout, so an unresponsive API
+# would hang the run instead of falling back to the static average. Replace it
+# with a version that times out after 10 s.
 from carbontracker.emissions.intensity.fetchers import electricitymaps as _ct_em
 from carbontracker import exceptions as _ct_exceptions
 import requests as _requests
@@ -132,9 +122,7 @@ def _carbon_intensity_by_location_with_timeout(self, lon=None, lat=None, zone=No
 
 _ct_em.ElectricityMap._carbon_intensity_by_location = _carbon_intensity_by_location_with_timeout
 
-# Statistical-robustness repeats: N_REPEATS independent runs, each with a
-# distinct seed, so mean +/- std over independent runs is reportable.
-# Override via env var for a cheap smoke test, e.g. N_REPEATS=1.
+# One independent run per seed; N_REPEATS=1 gives a quick smoke test.
 N_REPEATS = int(os.environ.get("N_REPEATS", "15"))
 BASE_SEED = int(os.environ.get("BASE_SEED", "0"))
 
@@ -142,13 +130,14 @@ def set_seed(seed: int):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 
-# ── Carbon helper functions ─────────────────────────────────────────────────
+# ── Carbon helpers ──────────────────────────────────────────────────────────
 def _parse_carbontracker_log(log_dir: Path, prefix: str):
-    """Robust CT log parser. CarbonTracker may write *_carbontracker.log
-    and/or *_carbontracker_output.log depending on version, and skips the
-    "Actual consumption" block if training stops before `monitor_epochs` is
-    reached — so this falls back through "Predicted consumption" and finally
-    to the last kWh/gCO2 numbers in the file."""
+    """Read (kWh, gCO2) from a CarbonTracker log.
+
+    The file may be *_carbontracker.log or *_carbontracker_output.log depending on
+    the version, and the "Actual consumption" block is missing if training stops
+    before `monitor_epochs`. So try "Actual", then "Predicted", and finally fall
+    back to the last kWh / gCO2 numbers in the file."""
     files = sorted(
         Path(log_dir).glob(f"{prefix}*carbontracker*.log"),
         key=lambda p: p.stat().st_mtime, reverse=True,
@@ -239,24 +228,23 @@ CARBON_CSV = Path(CKPT_DIR) / "colorado_stage2_carbon_log.csv"
 # ── Schema ────────────────────────────────────────────────────────────────────
 MARKER_COLS     = ['NIOBARA', 'FORT_HAYS', 'CODELL']
 INPUT_FEATURES  = ['GR_CLEAN', 'DEPTH_NORM']
-# No 'background' class: every well is cropped to start at its shallowest
-# known formation top (see WellGraphDataset.__getitem__ / fuse_well below), so
-# every remaining node has a real formation label. Wells with no known tops
-# at all are skipped entirely rather than labeled as background.
-N_CLASSES       = len(MARKER_COLS)   # 3
+# There is no background class. Each well is cropped to start at its shallowest
+# known top (see WellGraphDataset.__getitem__ and fuse_well), so every node has a
+# formation label, and wells with no known tops are skipped.
+N_CLASSES      = len(MARKER_COLS)   # 3
 MARKER_TO_CLASS = {'NIOBARA': 0, 'FORT_HAYS': 1, 'CODELL': 2}
 CLASS_NAMES     = ['NIOBARA', 'FORT_HAYS', 'CODELL']
 CLASS_COLORS    = ['#4472C4', '#70AD47', '#FFC000']
 WELL_COL        = 'wellName'
 DEPTH_COL       = 'DEPTH'
-GR_SENTINEL     = -9999.0          # invalid GR value → mask as NaN
-GR_CLIP_LO, GR_CLIP_HI = 0.0, 300.0   # physically plausible GR range
+GR_SENTINEL     = -9999.0             # marks a missing GR value
+GR_CLIP_LO, GR_CLIP_HI = 0.0, 300.0   # valid GR range; anything outside is masked
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 df_logs_raw = pd.read_parquet(os.path.join(BASE_TRAIN, "logs.parquet"))
 df_tops_raw = pd.read_parquet(os.path.join(BASE_TRAIN, "tops.parquet"))
 
-# Normalise well name to string in both tables
+# Well names are floats in the raw data; use strings in both tables.
 df_logs_raw[WELL_COL]   = df_logs_raw[WELL_COL].astype(str)
 df_tops_raw['well_name'] = df_tops_raw['well_name'].astype(str)
 df_tops_raw = df_tops_raw.set_index('well_name')[MARKER_COLS]
@@ -291,7 +279,7 @@ def well_log_cleaning(wn, df_log):
     df = df_log[df_log[WELL_COL] == wn][[DEPTH_COL, 'GR']].copy()
     if df.empty: return df
     df = df.sort_values(DEPTH_COL).reset_index(drop=True)
-    # Mask sentinel and out-of-range GR values
+    # Mask the sentinel and out-of-range GR values
     df['GR'] = df['GR'].replace(GR_SENTINEL, np.nan)
     df.loc[df['GR'] < GR_CLIP_LO, 'GR'] = np.nan
     df.loc[df['GR'] > GR_CLIP_HI, 'GR'] = np.nan
@@ -325,10 +313,10 @@ def create_graph(df, sv):
 
 
 def assign_labels(depths, sorted_tops):
-    """Assign MARKER_TO_CLASS labels given sorted (marker, depth) list.
-    Callers crop the well to start at its shallowest known top, so every
-    depth is guaranteed >= sorted_tops[0][1] and the default below is never
-    actually a background/invalid class."""
+    """Label each depth with the class of the deepest top at or above it.
+
+    `sorted_tops` is a depth-sorted list of (marker, depth). Callers crop the well
+    to start at the first top, so every depth is at or below it."""
     labels = []
     for d in depths:
         active = sorted_tops[0][0]
@@ -345,13 +333,8 @@ class WellGraphDataset(Dataset):
         tw = set(df_tops.index)
         self.wells = sorted(lw & tw)[:max_wells] if max_wells else sorted(lw & tw)
         self.df_log = df_log; self.df_tops = df_tops
-        # Graph construction (pandas well_log_cleaning + step_function + DGL
-        # graph build) is expensive and was previously redone from scratch on
-        # EVERY __getitem__ call -- i.e. every batch, every epoch, every rep,
-        # every architecture, even though the graph content is fully
-        # deterministic given (well, df_log, df_tops) and never depends on
-        # the training seed. Caching it here means it's built once and reused
-        # for the rest of the script's run.
+        # Building a graph (cleaning, step function, DGL) is slow and the result is
+        # deterministic and seed-independent, so each well is built once and cached.
         self._cache = {}
         print(f"  {len(self.wells)} wells")
 
@@ -371,11 +354,11 @@ class WellGraphDataset(Dataset):
 
         tops_row   = self.df_tops.loc[w].dropna()
         well_tops  = tops_row.to_dict()
-        if not well_tops: return self._empty()  # no known formation top -> nothing but background, skip well
+        if not well_tops: return self._empty()  # no known top, skip the well
         sorted_tops = sorted(well_tops.items(), key=lambda x: x[1])
         tops_list   = [v for _, v in sorted_tops]
 
-        df = df[df[DEPTH_COL] >= min(tops_list)].reset_index(drop=True)  # drop the background interval above the first top
+        df = df[df[DEPTH_COL] >= min(tops_list)].reset_index(drop=True)  # drop everything above the first top
         if df.empty: return self._empty()
 
         sv = step_function(float(df[DEPTH_COL].min()),
@@ -383,23 +366,20 @@ class WellGraphDataset(Dataset):
         g  = create_graph(df, sv)
         if g.num_nodes() == 0: return self._empty()
 
-        # Flag nodes near any formation boundary (±15 ft)
+        # Flag nodes within 15 ft of any formation top
         depths = g.ndata['pos'][:, 0].numpy()
         is_near_top = np.zeros(len(depths), dtype=bool)
         for t in tops_list:
             is_near_top |= (np.abs(depths - t) < 15.0)
         g.ndata['is_near_top'] = torch.tensor(is_near_top, dtype=torch.bool)
 
-        # Correct labels using proper depth-based assignment
         g.ndata['label'] = torch.tensor(
             assign_labels(depths, sorted_tops), dtype=torch.int64)
         return g
 
     def _empty(self):
-        # Genuinely 0-node graph, so collate()'s `num_nodes() > 0` filter
-        # actually drops it. A 1-node placeholder (the old behavior) slips
-        # through that filter and silently injects a fake all-zero-feature
-        # sample labeled class 0 into training/eval.
+        # Must have zero nodes so collate() drops it; a placeholder node would end
+        # up in training as a fake sample.
         return dgl.graph(([], []))
 
 
@@ -428,7 +408,7 @@ supports = torch.tensor(_inv, dtype=torch.float32).to(DEVICE)
 criterion = nn.CrossEntropyLoss(weight=supports)
 print(f"  Weights: { {n: f'{w:.2f}' for n, w in zip(CLASS_NAMES, _inv)} }")
 
-# ── Model definitions ──────────────────────────────────────────────────────────
+# ── Models ─────────────────────────────────────────────────────────────────────
 class GraphSAGEEmbed(nn.Module):
     def __init__(self, inf, h, nc, dropout=0.1):
         super().__init__()
@@ -451,8 +431,8 @@ class GraphSAGEEmbed(nn.Module):
 
 
 class ImprovedGNN(nn.Module):
-    """Stacked GraphConv with LeakyReLU, BN, dropout, and an embed() hook for Stage 2.
-    Mirrors north_sea/GNN/gnn_stage2_anomaly.py's ImprovedGNN exactly."""
+    """Stacked GraphConv, BatchNorm, LeakyReLU and dropout, with an embed() method
+    for Stage 2. Identical to ImprovedGNN in the North Sea script."""
     def __init__(self, inf, hidden_sizes, nc, dropout=0.1):
         super().__init__()
         self.convs = nn.ModuleList()
@@ -482,13 +462,13 @@ def _build_stage1(arch_name, nc):
     raise ValueError(f"Unknown arch: {arch_name}")
 
 
-# ── Per-well fusion (uses module-level stage1, iso — reassigned per repeat) ──
+# ── Per-well fusion (uses the module-level stage1 and iso, rebuilt every repeat) ──
 DETECTORS = [("IF only", "if")]
-RARE_CLASSES = [0, 1, 2]   # all formation classes (no background to exclude anymore)
+RARE_CLASSES = [0, 1, 2]   # every class is a formation
 
 
 def _apply_fusion(s1_preds, depths, emb, score, threshold):
-    """Per-well adaptive correction using confident Stage 1 predictions."""
+    """Correct boundaries in one well using its confident Stage 1 predictions."""
     is_anomaly     = score >= threshold
     fused          = s1_preds.copy()
     confident_mask = ~is_anomaly
@@ -519,11 +499,11 @@ def fuse_well(well, df_log, df_tops, threshold, smooth=11):
     if df.empty: return None
 
     well_tops   = df_tops.loc[well].dropna().to_dict() if well in df_tops.index else {}
-    if not well_tops: return None  # no known formation top for this well -> nothing to evaluate
+    if not well_tops: return None  # no known top, nothing to evaluate
     sorted_tops = sorted(well_tops.items(), key=lambda x: x[1])
     tops_list   = [v for _, v in sorted_tops]
 
-    df = df[df[DEPTH_COL] >= min(tops_list)].reset_index(drop=True)  # drop the background interval above the first top
+    df = df[df[DEPTH_COL] >= min(tops_list)].reset_index(drop=True)  # drop everything above the first top
     if df.empty: return None
 
     sv = step_function(float(df[DEPTH_COL].min()),
@@ -535,7 +515,7 @@ def fuse_well(well, df_log, df_tops, threshold, smooth=11):
     depths = g.ndata['pos'][:, 0].numpy()
     g.ndata['label'] = torch.tensor(
         assign_labels(depths, sorted_tops), dtype=torch.int64)
-    g = g.to(DEVICE)  # after CPU-side label assignment, before model inference
+    g = g.to(DEVICE)  # labels are assigned on CPU first
 
     stage1.eval()
     with torch.no_grad():
@@ -545,14 +525,11 @@ def fuse_well(well, df_log, df_tops, threshold, smooth=11):
 
     true_lbl = g.ndata['label'].cpu().numpy()
 
-    # Stage 1 smoothed predictions
+    # Smoothed Stage 1 predictions
     exp_l  = np.exp(logits - logits.max(1, keepdims=True))
     probs  = exp_l / exp_l.sum(1, keepdims=True)
     s_probs = scipy.ndimage.uniform_filter1d(probs, size=smooth, axis=0)
     s1_pred = s_probs.argmax(axis=1)
-    # (No "patch predicted-background-mid-well" correction anymore: with no
-    # background class, every class 0..N_CLASSES-1 is a real formation, so
-    # there's no longer a class that's invalid to predict mid-sequence.)
 
     # Anomaly scores
     if_sc = minmax_scale(-iso.score_samples(emb))
@@ -565,7 +542,7 @@ def fuse_well(well, df_log, df_tops, threshold, smooth=11):
     return true_lbl, s1_pred, fused, depths, scores
 
 
-# ── Repeat loop: for each architecture, N_REPEATS independent runs ─────────────
+# ── Training and evaluation loop: N_REPEATS runs per architecture ─────────────
 ARCHS = ['GraphSAGE', 'ImprovedGNN']
 H = 128; EPOCHS = 15; LR = 0.005
 LABELS = list(range(N_CLASSES))
@@ -574,12 +551,9 @@ print(f"\n{'='*62}")
 print(f"  {len(ARCHS)} arch(s) x {N_REPEATS} repeats, seeds {BASE_SEED}..{BASE_SEED+N_REPEATS-1}")
 print(f"{'='*62}")
 
-# ── Create the carbon-log CSV immediately (header only) ─────────────────────
-# Stage1+IF+eval for one repeat can take 45+ minutes, so without this the file
-# doesn't exist on disk until the first repeat finishes -- this writes the
-# header the instant the script starts so `ls`/`tail -f` on the VM finds it
-# right away. Column order MUST match the `row = {...}` dict built below,
-# since _write_carbon_row()'s schema-drift guard compares against this header.
+# One repeat can take 45+ minutes, so write the CSV header up front. The column
+# order must match the `row` dict built below, because _write_carbon_row()
+# archives the log if the header ever differs.
 _CARBON_CSV_COLUMNS = (
     ["run_id", "arch", "seed", "rep", "timestamp", "machine", "git_sha",
      "n_epochs_s1", "train_time_s", "eval_time_s",
@@ -626,7 +600,7 @@ for arch_name in ARCHS:
 
         stage1 = _build_stage1(arch_name, N_CLASSES).to(DEVICE)
 
-        # ── Stage 1 training (tracked) ──────────────────────────────────────
+        # Stage 1 training (tracked)
         s1_run = f"stage1_{arch_key}_seed{seed}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         cc_s1 = _build_cc(s1_run); ct_s1 = _build_ct(EPOCHS, s1_run)
         opt = torch.optim.Adam(stage1.parameters(), lr=LR)
@@ -662,7 +636,7 @@ for arch_name in ARCHS:
         s1_path = Path(CKPT_DIR) / f"stage1_colorado_{arch_key}_seed{seed}.pt"
         torch.save(stage1.state_dict(), s1_path)
 
-        # ── Stage 2a: Isolation Forest (tracked) ─────────────────────────────
+        # Stage 2: Isolation Forest (tracked)
         if_run = f"stage2a_{arch_key}_seed{seed}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         cc_if = _build_cc(if_run); ct_if = _build_ct(1, if_run)
         cc_if.start(); ct_if.epoch_start(); t0_if = time.time()
@@ -691,10 +665,9 @@ for arch_name in ARCHS:
         print(f"    IF: {len(embeds):,} total, {is_near_top.sum():,} near-top, "
               f"{(~is_near_top).sum():,} interior")
 
-        # ── Inference: threshold search + final eval, tracked SEPARATELY ────
-        # Timed and counted separately from the threshold search, which makes
-        # 16 extra passes over valid_ds.wells purely to pick a threshold --
-        # mixing that into "eval time" would make per-sample latency meaningless.
+        # Evaluation (tracked separately). The threshold search makes 16 extra passes
+        # over the validation wells, so it is timed apart from the final pass to keep
+        # the per-sample latency meaningful.
         eval_run = f"eval_{arch_key}_seed{seed}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         cc_eval = _build_cc(eval_run)
         cc_eval.start(); t0_eval = time.time()
@@ -758,7 +731,7 @@ for arch_name in ARCHS:
               f"final_eval={final_eval_time_s:.2f}s  ms/sample={ms_per_sample:.5f}  s/well={s_per_well:.4f}  "
               f"(thresh_search={thresh_search_time_s:.1f}s, excluded from the per-sample numbers above)")
 
-        # ── Read back both trackers + country/grid audit ─────────────────────
+        # Read both trackers back and check the grid intensity
         ct_kwh_s1, ct_co2_s1 = _parse_carbontracker_log(CARBON_DIR, prefix=s1_run + "_")
         cc_blob_s1 = _read_codecarbon_csv(CARBON_DIR / f"{s1_run}_codecarbon.csv")
         ct_kwh_if, ct_co2_if = _parse_carbontracker_log(CARBON_DIR, prefix=if_run + "_")
@@ -817,7 +790,7 @@ for arch_name in ARCHS:
         if torch.cuda.is_available():
             torch.cuda.empty_cache(); torch.cuda.ipc_collect()
 
-    # ── Aggregate this arch's repeats: mean +/- std, Norway-like rows only ──
+    # Mean +/- std over this architecture's repeats (Norway-like grid rows only)
     df_arch = pd.DataFrame(arch_rep_rows)
     bad = df_arch[~df_arch["grid_ok"]]
     if len(bad):
@@ -830,8 +803,7 @@ for arch_name in ARCHS:
     for c in AGG_COLS:
         print(f"  {c:<24} {means[c]:>10.5f}  +/- {stds[c]:>9.5f}")
 
-    # Reporting uses this arch's LAST repeat (all_true/all_s1/all_fused still
-    # in scope from the loop above)
+    # Reports below use the last repeat (its predictions are still in scope)
     print(f"\n── {arch_name}: Stage 1 only (last rep) ────────────────────────")
     print(classification_report(all_true, all_s1, target_names=CLASS_NAMES,
                                  labels=LABELS, zero_division=0))
@@ -847,7 +819,7 @@ for arch_name in ARCHS:
         'co2_total_std_g':  float(stds['cc_total_emissions_g']),
     }
 
-# ── Combined architecture comparison (last rep of each arch) ───────────────────
+# ── Comparison across architectures (last repeat of each) ──────────────────────
 print("\n\n" + "="*70)
 print("  COMBINED ARCHITECTURE COMPARISON  (perf: last repeat | carbon: mean of valid reps)")
 print("="*70)
@@ -865,7 +837,7 @@ for arch_name, res in arch_results.items():
             co2_str = "—"
         print(f"  {arch_name:<12} {label:<16} {acc:>6.4f} {wf1:>6.4f} {mf1:>7.4f}  {co2_str:>26}  {res['n_reps_valid']:>6}")
 
-# ── Confusion matrices: 2 archs x (Stage1 + Stage1+IF) ──────────────────────────
+# ── Confusion matrices (one row per architecture: Stage 1, Stage 1 + IF) ───────
 n_methods = 1 + len(DETECTORS)
 fig, axes = plt.subplots(len(ARCHS), n_methods, figsize=(7*n_methods, 6*len(ARCHS)), squeeze=False)
 for row_idx, arch_name in enumerate(ARCHS):
@@ -886,7 +858,7 @@ plt.savefig(CONF_PATH, dpi=150, bbox_inches='tight')
 print(f"\nConfusion matrix → {CONF_PATH}")
 print(f"Carbon log → {CARBON_CSV}")
 
-# ── Per-arch carbon charts (mirrors north_sea/GNN/gnn_stage2_anomaly.py) ────────
+# ── Carbon charts ───────────────────────────────────────────────────────────────
 df_rep_all = pd.DataFrame(rep_rows)
 df_ok_all = df_rep_all[df_rep_all["grid_ok"]]
 if len(df_ok_all):

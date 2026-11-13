@@ -1,16 +1,21 @@
 """
-Stage 2 Anomaly Detection — dual carbon tracking (CarbonTracker + CodeCarbon),
-matching the methodology of the LSTM carbon-tracking notebook
-(north_sea_carbon_tracking.ipynb):
-  - CodeCarbon `OfflineEmissionsTracker` pinned to Norway (no IP-based country
-    auto-detection) + CarbonTracker pointed at the live Electricity Maps API.
-  - Training and inference emissions measured with separate trackers.
-  - N_REPEATS independent runs per architecture (distinct seed each) so
-    mean +/- std over independent runs is reportable.
-  - Grid-intensity audit: flags any run whose implied gCO2/kWh falls outside
-    Norway's ~5-80 g/kWh band (catches a silently failed country pin).
-  - Incremental CSV log guarded against schema drift.
-Runs both GraphSAGE and ImprovedGNN and compares results.
+GNN + Isolation Forest formation-boundary detection on the North Sea wells,
+with carbon tracking, for GraphSAGE and ImprovedGNN.
+
+Stage 1: node-level GNN classifier over six formations.
+Stage 2: Isolation Forest on the node embeddings, used to correct boundaries.
+
+Carbon tracking follows north_sea_carbon_tracking.ipynb:
+  - CodeCarbon runs offline pinned to Norway; CarbonTracker reads live grid
+    intensity from Electricity Maps.
+  - Training and evaluation are measured with separate trackers.
+  - N_REPEATS seeds per architecture, reported as mean +/- std.
+  - Any run whose implied intensity falls outside Norway's ~5-80 g/kWh band is
+    flagged (a failed country pin) and excluded from the aggregates.
+  - Results are appended to a CSV that is archived if its columns ever change.
+
+Environment variables: CKPT_DIR, OUT_DIR, N_REPEATS, BASE_SEED, ARCHS_OVERRIDE,
+ELECTRICITYMAPS_API_KEY.
 """
 
 import subprocess, sys
@@ -39,10 +44,8 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-# Model + every DGL graph batch must be moved onto this device explicitly --
-# neither PyTorch nor DGL do it automatically, so without these .to(DEVICE)
-# calls everything silently runs on CPU even with a GPU present and detected
-# by CodeCarbon/CarbonTracker.
+# Models and graph batches are moved to this device explicitly with .to(DEVICE);
+# neither PyTorch nor DGL does it for you.
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 CKPT_DIR   = os.environ.get("CKPT_DIR", "/home/jupyter/stage2_ckpt")
@@ -60,12 +63,10 @@ try:
 except Exception:
     GIT_SHA = "unknown"
 
-# ── Carbon tracker configuration ────────────────────────────────────────────
-# CodeCarbon uses OfflineEmissionsTracker(country_iso_code="NOR") so the
-# country is never auto-detected from the VM's outbound IP. CarbonTracker is
-# pointed at the Electricity Maps API (key from env — never hardcode a secret
-# here) so it pulls live Norwegian grid intensity at runtime. Both measure the
-# same GPU via NVML; CarbonTracker is GPU-only, CodeCarbon covers CPU+GPU+RAM.
+# Carbon accounting is pinned to Norway: CodeCarbon runs offline with an explicit
+# country code, and CarbonTracker reads live grid intensity from Electricity Maps
+# when ELECTRICITYMAPS_API_KEY is set. Both read the GPU through NVML;
+# CarbonTracker covers the GPU only, CodeCarbon covers CPU, GPU and RAM.
 CARBON_COUNTRY_ISO3 = "NOR"
 _ELECTRICITYMAPS_KEY = os.environ.get("ELECTRICITYMAPS_API_KEY")
 _ct_api_keys = {"electricitymaps": _ELECTRICITYMAPS_KEY} if _ELECTRICITYMAPS_KEY else None
@@ -74,10 +75,8 @@ if _ct_api_keys is None:
           "will fall back to its built-in average grid-intensity estimate instead of "
           "live data. Set the env var to match the notebook's methodology exactly.")
 
-# Statistical-robustness repeats: N_REPEATS independent runs per architecture,
-# each with a distinct seed, so mean +/- std over independent runs is
-# reportable (matches the LSTM carbon-tracking notebook's N_REPEATS=15).
-# Override via env var for a cheap smoke test, e.g. N_REPEATS=1.
+# One independent run per seed, 15 by default as in the LSTM carbon notebook;
+# N_REPEATS=1 gives a quick smoke test.
 N_REPEATS = int(os.environ.get("N_REPEATS", "15"))
 BASE_SEED = int(os.environ.get("BASE_SEED", "0"))
 
@@ -85,13 +84,14 @@ def set_seed(seed: int):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 
-# ── Carbon helper functions ─────────────────────────────────────────────────
+# ── Carbon helpers ──────────────────────────────────────────────────────────
 def _parse_carbontracker_log(log_dir: Path, prefix: str):
-    """Robust CT log parser. CarbonTracker may write *_carbontracker.log
-    and/or *_carbontracker_output.log depending on version, and skips the
-    "Actual consumption" block if training stops before `monitor_epochs` is
-    reached — so this falls back through "Predicted consumption" and finally
-    to the last kWh/gCO2 numbers in the file."""
+    """Read (kWh, gCO2) from a CarbonTracker log.
+
+    The file may be *_carbontracker.log or *_carbontracker_output.log depending on
+    the version, and the "Actual consumption" block is missing if training stops
+    before `monitor_epochs`. So try "Actual", then "Predicted", and finally fall
+    back to the last kWh / gCO2 numbers in the file."""
     files = sorted(
         Path(log_dir).glob(f"{prefix}*carbontracker*.log"),
         key=lambda p: p.stat().st_mtime, reverse=True,
@@ -143,9 +143,8 @@ def _tracker_spread(ct_co2_g, cc_emissions_kg):
     return 100.0 * abs(cc_g - ct_co2_g) / (0.5 * (ct_co2_g + cc_g))
 
 def _grid_tag(g_per_kwh):
-    """Flags whether an implied gCO2/kWh reading is Norway-like — catches a
-    silently failed country pin (e.g. CodeCarbon falling back to VM-IP
-    geolocation instead of the explicit country_iso_code)."""
+    """Label an implied gCO2/kWh value as Norway-like or not. This catches a failed
+    country pin, e.g. CodeCarbon falling back to IP geolocation."""
     if np.isnan(g_per_kwh):       return "?? (no data)"
     if 5   <= g_per_kwh <= 80:    return "Norway-like  OK"
     if 200 <= g_per_kwh <= 320:   return "Netherlands-like  FAILED PIN"
@@ -165,9 +164,9 @@ def _build_cc(run_name: str) -> OfflineEmissionsTracker:
     )
 
 def _build_ct(n_epochs: int, run_name: str) -> CarbonTracker:
-    # monitor_epochs=1 + epochs_before_pred=1 makes CT log a result after the
-    # FIRST epoch (predicted) and again once training completes (actual) —
-    # so a reading is always available even if a run stops early.
+    # monitor_epochs=1 and epochs_before_pred=1 make CarbonTracker log a prediction
+    # after the first epoch and the actual figure at the end, so a reading exists
+    # even if a run stops early.
     return CarbonTracker(
         epochs=n_epochs, monitor_epochs=1, epochs_before_pred=1,
         log_dir=str(CARBON_DIR), log_file_prefix=run_name + "_",
@@ -175,9 +174,8 @@ def _build_ct(n_epochs: int, run_name: str) -> CarbonTracker:
     )
 
 def _write_carbon_row(row: dict, csv_path: Path):
-    """Append one row to csv_path, guarding against schema drift — an
-    existing log with a different column set would otherwise silently turn
-    into a ragged CSV that pandas can't parse back."""
+    """Append one row to csv_path. If the existing log has different columns it is
+    renamed to a .bak.csv first, so the file never ends up with ragged rows."""
     df1 = pd.DataFrame([row])
     if csv_path.exists():
         with open(csv_path) as f:
@@ -188,7 +186,7 @@ def _write_carbon_row(row: dict, csv_path: Path):
             print(f"  [log] schema changed — archived old log -> {bak.name}")
     df1.to_csv(csv_path, mode="a", header=not csv_path.exists(), index=False)
 
-# Incremental CSV log (one row per repeat)
+# One row is appended per repeat
 CARBON_CSV = Path(CKPT_DIR) / "stage2_carbon_log.csv"
 
 # ── Data ──────────────────────────────────────────────────────────────────
@@ -200,11 +198,10 @@ df_tops_valid = pd.read_parquet(os.path.join(base_dir, "tops_valid.parquet"))
 
 MARKER_COLS     = ['DUNLIN','HORDALAND','ROGALAND','SHETLAND','VESTLAND','VIKING']
 INPUT_FEATURES  = ['GR_CLEAN', 'RHOB_CLEAN', 'DEEPRES_CLEAN', 'DEPTH_NORM']
-# No 'background' class: every well is cropped to start at its shallowest known
-# formation top (see WellGraphDataset.__getitem__ / fuse_well below), so every
-# remaining node has a real formation label. Wells with no known tops at all
-# are skipped entirely rather than labeled as background.
-N_CLASSES       = len(MARKER_COLS)   # 6
+# There is no background class. Each well is cropped to start at its shallowest
+# known top (see WellGraphDataset.__getitem__ and fuse_well), so every node has a
+# formation label, and wells with no known tops are skipped.
+N_CLASSES      = len(MARKER_COLS)   # 6
 MARKER_TO_CLASS = {'DUNLIN':0,'HORDALAND':1,'ROGALAND':2,
                    'SHETLAND':3,'VESTLAND':4,'VIKING':5}
 CLASS_NAMES     = ['DUNLIN','HORDALAND','ROGALAND','SHETLAND','VESTLAND','VIKING']
@@ -251,13 +248,8 @@ class WellGraphDataset(Dataset):
         self.wells=sorted(lw&tw)[:max_wells] if max_wells else sorted(lw&tw)
         self.df_log=df_log; self.df_tops=df_tops
         self.feats=feats; self.with_marker=with_marker
-        # Graph construction (pandas well_log_cleaning + step_function + DGL
-        # graph build) is expensive and was previously redone from scratch on
-        # EVERY __getitem__ call -- i.e. every batch, every epoch, every rep,
-        # every architecture, even though the graph content is fully
-        # deterministic given (well, df_log, df_tops) and never depends on
-        # the training seed. Caching it here means it's built once and reused
-        # for the rest of the script's run.
+        # Building a graph (cleaning, step function, DGL) is slow and the result is
+        # deterministic and seed-independent, so each well is built once and cached.
         self._cache = {}
         print(f"  {len(self.wells)} wells")
     def __len__(self): return len(self.wells)
@@ -272,8 +264,8 @@ class WellGraphDataset(Dataset):
         df=well_log_cleaning(w, self.df_log, self.feats)
         if df.empty: return self._empty()
         tops=self.df_tops.loc[w].dropna().tolist() if w in self.df_tops.index else []
-        if not tops: return self._empty()  # no known formation top -> nothing but background, skip well
-        df = df[df['DS_INDEX'] >= min(tops)].reset_index(drop=True)  # drop the background interval above the first top
+        if not tops: return self._empty()  # no known top, skip the well
+        df = df[df['DS_INDEX'] >= min(tops)].reset_index(drop=True)  # drop everything above the first top
         if df.empty: return self._empty()
         sv=step_function(float(df['DS_INDEX'].min()),float(df['DS_INDEX'].max()),sorted(tops))
         g=create_graph(df, sv)
@@ -288,7 +280,7 @@ class WellGraphDataset(Dataset):
         sorted_tops = sorted(well_tops.items(), key=lambda x: x[1])
         fixed_labels = []
         for d in depths:
-            active_marker = sorted_tops[0][0]  # crop above guarantees d >= the shallowest top
+            active_marker = sorted_tops[0][0]  # the crop above guarantees d >= the first top
             for marker_name, top_depth in sorted_tops:
                 if d >= top_depth: active_marker = marker_name
                 else: break
@@ -303,10 +295,8 @@ class WellGraphDataset(Dataset):
                 [MARKER_TO_CLASS.get(l, 0) for l in ml], dtype=torch.int64)
         return g
     def _empty(self):
-        # Genuinely 0-node graph, so collate()'s `num_nodes() > 0` filter
-        # actually drops it. A 1-node placeholder (the old behavior) slips
-        # through that filter and silently injects a fake all-zero-feature
-        # sample labeled class 0 into training/eval.
+        # Must have zero nodes so collate() drops it; a placeholder node would end
+        # up in training as a fake sample.
         return dgl.graph(([],[]))
 
 def collate(s):
@@ -319,7 +309,7 @@ valid_ds = WellGraphDataset(df_log_valid,df_tops_valid,INPUT_FEATURES)
 train_dl = DataLoader(train_ds,batch_size=4,shuffle=True, collate_fn=collate)
 valid_dl = DataLoader(valid_ds,batch_size=4,shuffle=False,collate_fn=collate)
 
-# ── Formation depth priors from TRAINING wells only ───────────────────────
+# ── Formation depth priors (median top over training wells only) ──────────
 PRIOR_TOPS = {col: float(df_tops_train[col].median())
               for col in MARKER_COLS if df_tops_train[col].notna().sum() > 0}
 PRIOR_SORTED_TOPS = sorted(PRIOR_TOPS.items(), key=lambda x: x[1])
@@ -327,7 +317,7 @@ print(f"  Formation depth priors: { {k: f'{v:.0f}ft' for k,v in PRIOR_SORTED_TOP
 
 # ── Models ────────────────────────────────────────────────────────────────
 class GraphSAGEEmbed(nn.Module):
-    """3-layer GraphSAGE with embed() hook for Stage 2."""
+    """Three GraphSAGE layers, with an embed() method for Stage 2."""
     def __init__(self, inf, h, nc, dropout=0.1):
         super().__init__()
         self.c1=dglnn.SAGEConv(inf,h,'mean'); self.c2=dglnn.SAGEConv(h,h,'mean')
@@ -342,7 +332,8 @@ class GraphSAGEEmbed(nn.Module):
     def forward(self, g, x): return self.fc(self.embed(g, x))
 
 class ImprovedGNN(nn.Module):
-    """Stacked GraphConv with LeakyReLU, BN, dropout, and an embed() hook for Stage 2."""
+    """Stacked GraphConv, BatchNorm, LeakyReLU and dropout, with an embed() method
+    for Stage 2."""
     def __init__(self, inf, hidden_sizes, nc, dropout=0.1):
         super().__init__()
         self.convs = nn.ModuleList()
@@ -385,7 +376,7 @@ def _build_stage1(arch_name, nc):
         return ImprovedGNN(len(INPUT_FEATURES), [128, 256, 256, 128, 64], nc)
     raise ValueError(f"Unknown arch: {arch_name}")
 
-# ── Shared hyperparams & class weights (same for all archs) ───────────────
+# ── Hyperparameters and class weights (shared by both architectures) ─────
 EPOCHS=15; LR=0.005; NC=N_CLASSES
 
 print("Computing class weights from training label frequencies...")
@@ -401,13 +392,13 @@ supports  = torch.tensor(_inv, dtype=torch.float32).to(DEVICE)
 criterion = nn.CrossEntropyLoss(weight=supports)
 print(f"  Weights: { {n: f'{w:.2f}' for n,w in zip(CLASS_NAMES, _inv)} }")
 
-# ── Per-well fusion (uses module-level stage1, iso — reassigned per repeat) ──
+# ── Per-well fusion (uses the module-level stage1 and iso, rebuilt every repeat) ──
 def fuse_well(well, df_log, df_tops, threshold, smooth=11):
     df = well_log_cleaning(well, df_log, INPUT_FEATURES)
     if df.empty: return None
     tops = df_tops.loc[well].dropna().tolist() if well in df_tops.index else []
-    if not tops: return None  # no known formation top for this well -> nothing to evaluate
-    df = df[df['DS_INDEX'] >= min(tops)].reset_index(drop=True)  # drop the background interval above the first top
+    if not tops: return None  # no known top, nothing to evaluate
+    df = df[df['DS_INDEX'] >= min(tops)].reset_index(drop=True)  # drop everything above the first top
     if df.empty: return None
     shetland_depth = None
     if well in df_tops.index and 'SHETLAND' in df_tops.columns:
@@ -422,17 +413,16 @@ def fuse_well(well, df_log, df_tops, threshold, smooth=11):
     depths = g.ndata['pos'][:, 0].numpy()
     fixed_labels = []
     for d in depths:
-        active_marker = sorted_tops[0][0]  # crop above guarantees d >= the shallowest top
+        active_marker = sorted_tops[0][0]  # the crop above guarantees d >= the first top
         for marker_name, top_depth in sorted_tops:
             if d >= top_depth: active_marker = marker_name
             else: break
         fixed_labels.append(MARKER_TO_CLASS[active_marker])
     g.ndata['label'] = torch.tensor(fixed_labels, dtype=torch.int64)
-    g = g.to(DEVICE)  # after CPU-side label assignment, before model inference
-    stage1.to(DEVICE)  # stage1.cpu() runs at the end of every rep (frees GPU
-    # memory between reps) -- fuse_well is also called from the post-loop
-    # plot_well() using the last rep's already-.cpu()'d module-level stage1,
-    # so without this the model and graph end up on different devices.
+    g = g.to(DEVICE)  # labels are assigned on CPU first
+    # stage1 is moved back to the CPU after every repeat to free GPU memory, and
+    # plot_well() calls this after the loop, so put the model back on DEVICE here.
+    stage1.to(DEVICE)
     stage1.eval()
     with torch.no_grad():
         feat   = g.ndata['features']
@@ -443,9 +433,6 @@ def fuse_well(well, df_log, df_tops, threshold, smooth=11):
     probs        = exp_l / exp_l.sum(1, keepdims=True)
     smooth_probs = scipy.ndimage.uniform_filter1d(probs, size=smooth, axis=0)
     s1_preds     = smooth_probs.argmax(axis=1)
-    # (No "patch predicted-background-mid-well" correction anymore: with no
-    # background class, every class 0..NC-1 is a real formation, so there's
-    # no longer a class that's invalid to predict mid-sequence.)
     if_sc = minmax_scale(-iso.score_samples(emb))
     combo = scipy.ndimage.uniform_filter1d(if_sc, size=smooth)
     local_mean = scipy.ndimage.uniform_filter1d(combo, size=201)
@@ -511,12 +498,9 @@ def plot_well(well, df_log, df_tops, threshold, smooth=11, out_path=None):
     print(f"Plot saved → {out}")
     return out
 
-# ── Per-architecture sweep, N_REPEATS independent runs each ────────────────
-# ARCHS_OVERRIDE lets you resume a subset (e.g. just the remaining seeds of
-# one architecture) without touching BASE_SEED/N_REPEATS for the other arch,
-# e.g. ARCHS_OVERRIDE="GraphSAGE" BASE_SEED=5 N_REPEATS=10 to pick up
-# GraphSAGE from seed 5 onward, leaving ImprovedGNN's full 0..14 range for a
-# separate run.
+# ── Training and evaluation loop: N_REPEATS runs per architecture ───────────
+# ARCHS_OVERRIDE runs a subset, e.g. ARCHS_OVERRIDE="GraphSAGE" BASE_SEED=5
+# N_REPEATS=10 to finish GraphSAGE from seed 5 onward.
 _archs_override = os.environ.get("ARCHS_OVERRIDE")
 ARCHS = [a.strip() for a in _archs_override.split(",")] if _archs_override else ['GraphSAGE', 'ImprovedGNN']
 arch_results    = {}
@@ -539,7 +523,7 @@ for arch_name in ARCHS:
         opt = torch.optim.Adam(stage1.parameters(), lr=LR)
         sch = torch.optim.lr_scheduler.StepLR(opt, step_size=10, gamma=0.5)
 
-        # ── Stage 1 training (tracked) ──────────────────────────────────────
+        # Stage 1 training (tracked)
         s1_run = f"stage1_{arch_key}_seed{seed}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         cc_s1 = _build_cc(s1_run)
         ct_s1 = _build_ct(EPOCHS, s1_run)
@@ -570,7 +554,7 @@ for arch_name in ARCHS:
         s1_path = Path(CKPT_DIR) / f"stage1_{arch_key}_seed{seed}.pt"
         torch.save(stage1.state_dict(), s1_path)
 
-        # ── Stage 2a: Isolation Forest (tracked) ────────────────────────────
+        # Stage 2: Isolation Forest (tracked)
         stage1.eval(); embeds=[]; is_near_top_list=[]
         with torch.no_grad():
             for bg in train_dl:
@@ -597,12 +581,9 @@ for arch_name in ARCHS:
             except Exception: pass
         elapsed_if = time.time() - t0_if
 
-        # ── Inference: threshold search + final eval, tracked SEPARATELY ────
-        # (mirrors the notebook's train-vs-inference split: a second, inference-
-        # scoped CodeCarbon tracker wraps the well-prediction loop on its own.)
-        # Timed and counted separately from the threshold search, which makes
-        # extra passes over valid_ds.wells purely to pick a threshold -- mixing
-        # that into "eval time" would make per-sample latency meaningless.
+        # Evaluation (tracked separately, as in the notebook's train/inference split).
+        # The threshold search makes extra passes over the validation wells, so it is
+        # timed apart from the final pass to keep the per-sample latency meaningful.
         eval_run = f"eval_{arch_key}_seed{seed}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         cc_eval = _build_cc(eval_run)
         cc_eval.start(); t0_eval = time.time()
@@ -646,7 +627,7 @@ for arch_name in ARCHS:
         if_mf1 = f1_score(all_true, all_fused, average='macro', zero_division=0)
         if_recall = recall_score(all_true, all_fused, average='weighted', zero_division=0)
 
-        # ── Read back both trackers ──────────────────────────────────────────
+        # Read both trackers back
         ct_kwh_s1, ct_co2_s1 = _parse_carbontracker_log(CARBON_DIR, prefix=s1_run + "_")
         cc_blob_s1   = _read_codecarbon_csv(CARBON_DIR / f"{s1_run}_codecarbon.csv")
         ct_kwh_if, ct_co2_if = _parse_carbontracker_log(CARBON_DIR, prefix=if_run + "_")
@@ -660,7 +641,7 @@ for arch_name in ARCHS:
         ct_train_kwh = np.nansum([ct_kwh_s1, ct_kwh_if])
         ct_train_g   = np.nansum([ct_co2_s1, ct_co2_if])
 
-        # ── Country / grid-intensity audit: trust the math, not the metadata ──
+        # Grid-intensity check from the measured numbers, not the tracker's metadata
         cc_implied = (cc_train_g / (cc_train_kwh * 1000)) * 1000 if cc_train_kwh > 0 else np.nan
         ct_implied = ct_train_g / ct_train_kwh if ct_train_kwh > 0 else np.nan
         spread = _tracker_spread(ct_train_g, cc_train_g / 1000)
@@ -715,7 +696,7 @@ for arch_name in ARCHS:
         if torch.cuda.is_available():
             torch.cuda.empty_cache(); torch.cuda.ipc_collect()
 
-    # ── Aggregate across repeats: mean +/- std, Norway-like rows only ───────
+    # Mean +/- std over this architecture's repeats (Norway-like grid rows only)
     df_rep = pd.DataFrame(rep_rows)
     bad = df_rep[~df_rep["grid_ok"]]
     if len(bad):
@@ -735,8 +716,8 @@ for arch_name in ARCHS:
     for c in AGG_COLS:
         print(f"    {c:<24} {means[c]:>10.5f}  +/- {stds[c]:>9.5f}")
 
-    # Post-loop reporting uses the LAST repeat's trained stage1/iso + eval arrays
-    # (fuse_well/plot_well read `stage1`/`iso` as module-level names).
+    # Reports below use the last repeat's model and predictions
+    # (fuse_well and plot_well read `stage1` and `iso` as module-level names).
     LABELS=list(range(N_CLASSES))
     print(f"\n── {arch_name} Stage 1 only ──────────────────────────────────────")
     print(classification_report(all_true, all_s1, target_names=CLASS_NAMES, labels=LABELS, zero_division=0))
@@ -762,11 +743,11 @@ for arch_name in ARCHS:
         'n_reps_valid': len(df_ok), 'carbon_rows': rep_rows,
     }
 
-    # per-well plot from the last repeat's model
+    # Example well plot from the last repeat's model
     plot_well(valid_ds.wells[0], df_log_valid, df_tops_valid, best_thresh,
               out_path=f'{CKPT_DIR}/well_{valid_ds.wells[0]}_{arch_key}_stage2.png')
 
-# ── Combined architecture comparison ──────────────────────────────────────
+# ── Comparison across architectures ───────────────────────────────────────
 print("\n\n" + "="*70)
 print("  COMBINED ARCHITECTURE COMPARISON  (perf: last repeat | carbon: mean of valid reps)")
 print("="*70)
@@ -784,7 +765,7 @@ for arch_name, res in arch_results.items():
             co2_str = "—"
         print(f"  {arch_name:<12} {label:<16} {acc:>6.4f} {wf1:>6.4f} {wr:>6.4f}  {co2_str:>28}  {res['n_reps_valid']:>6}")
 
-# ── Combined confusion matrices (2 archs × 2 preds = 4 subplots) ──────────
+# ── Confusion matrices (2 architectures x Stage 1 / Stage 1 + IF) ──────────
 fig, axes = plt.subplots(2, 2, figsize=(18, 12))
 for row_idx, (arch_name, res) in enumerate(arch_results.items()):
     for col_idx, (preds, title) in enumerate([
@@ -806,13 +787,13 @@ plt.close()
 print(f"\nConfusion matrix comparison → {out_fig}")
 print(f"Carbon log → {CARBON_CSV}")
 
-# ── Per-model carbon charts (mirrors the LSTM carbon-tracking notebook) ────
+# ── Carbon charts (same layout as the LSTM carbon-tracking notebook) ───────
 df_carbon_all = pd.DataFrame(all_carbon_rows)
 if len(df_carbon_all):
     df_ok_all = df_carbon_all[df_carbon_all["grid_ok"]]
     fig, axes = plt.subplots(1, 3, figsize=(20, 5))
 
-    # (1) Per-arch training emissions: CT vs CC (mean +/- std across reps)
+    # 1. Training emissions per architecture, CarbonTracker vs CodeCarbon
     ax = axes[0]
     g = df_ok_all.groupby("arch")[["ct_emissions_g", "cc_emissions_g"]].agg(['mean', 'std'])
     x = np.arange(len(g)); w = 0.35
@@ -823,7 +804,7 @@ if len(df_carbon_all):
     ax.set_xticks(x); ax.set_xticklabels(g.index); ax.set_ylabel("Training emissions (gCO2eq)")
     ax.set_title("Training emissions: CT vs CC"); ax.legend(fontsize=8)
 
-    # (2) CodeCarbon energy breakdown CPU/GPU/RAM
+    # 2. CodeCarbon energy split into CPU, GPU and RAM
     ax = axes[1]
     g2 = df_ok_all.groupby("arch")[["cc_cpu_kwh", "cc_gpu_kwh", "cc_ram_kwh"]].mean() * 1000
     bottom = np.zeros(len(g2))
@@ -832,7 +813,7 @@ if len(df_carbon_all):
         bottom += g2[col].values
     ax.set_ylabel("Energy (Wh)"); ax.set_title("CodeCarbon energy breakdown"); ax.legend(fontsize=8)
 
-    # (3) Training vs inference emissions (stacked)
+    # 3. Training vs inference emissions, stacked
     ax = axes[2]
     g3 = df_ok_all.groupby("arch")[["cc_emissions_g", "cc_eval_emissions_g"]].mean()
     ax.bar(g3.index, g3["cc_emissions_g"], label="Training", color="#4472C4")

@@ -19,7 +19,7 @@ variant is not part of these runs).
 
 **Filename caveats - please read before reusing these scripts:**
 
-* **Colorado:** the script that produced the results is the `*_local.py` file (924 lines: dataset
+* **Colorado:** the script that produced the results is the `*_local.py` file (dataset
   caching, GPU placement, `stage1_recall`/`if_recall`, ImprovedGNN, per-arch aggregation). The
   un-suffixed `gnn_stage2_anomaly_colorado.py` is an older, independently developed version
   (no caching fix, no recall columns, no ImprovedGNN) and was **not** used for these numbers.
