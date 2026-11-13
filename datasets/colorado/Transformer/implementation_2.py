@@ -10,14 +10,6 @@ from sklearn.metrics import classification_report, confusion_matrix
 from torch.utils.data import DataLoader, Dataset
 
 
-# ---------------------------------------------------------------------------
-# Environment
-# ---------------------------------------------------------------------------
-
-# I am currently running it on kaggle gpu 
-# at the moment which is why I have a kaggle path
-#os.chdir("/kaggle/working")
-
 def reset_seeds(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
@@ -27,10 +19,6 @@ def reset_seeds(seed: int = 42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 
 IGNORE_INDEX = -100
 
@@ -45,15 +33,10 @@ DEFAULT_TOP_COLS = [
     "DUNLIN",
 ]
 
-# Half-width (in depth samples) around each boundary used to build edge labels.
-# At srate=2.0m this gives a ±50m window around each top — wide enough for the
-# model to see the signal but not so wide it blurs adjacent boundaries.
+# edge label half-width in samples, ±100 in depth around each top at srate=4
+# (wide enough to see the signal, narrow enough not to blur neighbouring tops)
 EDGE_HALF_WIDTH = 25
 
-
-# ---------------------------------------------------------------------------
-# 1.  DATASET
-# ---------------------------------------------------------------------------
 
 class WellLogDataset(Dataset):
     def __init__(self, X: np.ndarray, y: np.ndarray, y_edge: np.ndarray):
@@ -69,13 +52,9 @@ class WellLogDataset(Dataset):
         return self.X[idx], self.y[idx], self.y_edge[idx]
 
 
-# ---------------------------------------------------------------------------
-# SEGMENTATION HEAD
-# ---------------------------------------------------------------------------
-
 class SegmentationHead(nn.Module):
     """
-    Per-patch MLP → upsample to seq_len.
+    Per-patch MLP, then upsampled to seq_len.
     Input:  (bs, n_vars, feat_dim, patch_num)
     Output: (bs, seq_len, n_classes)
     """
@@ -105,16 +84,12 @@ class SegmentationHead(nn.Module):
         return z.permute(0, 2, 1)                                    # (bs, seq_len, n_classes)
 
 
-# ---------------------------------------------------------------------------
-# EDGE HEAD
-# ---------------------------------------------------------------------------
-
 class EdgeHead(nn.Module):
     """
     Binary head predicting P(depth sample is near a zone boundary).
     Shares backbone features with the segmentation head.
     Input:  (bs, n_vars, feat_dim, patch_num)
-    Output: (bs, seq_len)   — raw logits (apply sigmoid for probability)
+    Output: (bs, seq_len), raw logits (apply sigmoid for probability)
     """
     def __init__(self, feat_dim: int, n_vars: int, patch_num: int,
                  seq_len: int, dropout: float = 0.1):
@@ -140,10 +115,6 @@ class EdgeHead(nn.Module):
         z = self.upsample(z.unsqueeze(1)).squeeze(1)                 # (bs, seq_len)
         return z
 
-
-# ---------------------------------------------------------------------------
-# FULL MODEL
-# ---------------------------------------------------------------------------
 
 class PatchTSTSegmenter(nn.Module):
     def __init__(
@@ -218,14 +189,10 @@ class PatchTSTSegmenter(nn.Module):
         return z
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Returns (seg_logits, edge_logits) — shapes (bs, seq_len, n_classes) and (bs, seq_len)."""
+        """Returns (seg_logits, edge_logits), shapes (bs, seq_len, n_classes) and (bs, seq_len)."""
         z = self._encode(x)
         return self.seg_head(z), self.edge_head(z)
 
-
-# ---------------------------------------------------------------------------
-# DATA PREPARATION
-# ---------------------------------------------------------------------------
 
 def build_tops_seq(
     depth_arr: np.ndarray,
@@ -274,7 +241,7 @@ def build_edge_seq(
 
     # Detect transitions between known labels
     valid = zone_labels.copy()
-    valid[mask] = -999          # sentinel; transitions into/out of masked regions are ignored
+    valid[mask] = -999          # sentinel, so transitions into or out of masked regions are ignored
 
     transitions = np.where(np.diff(valid) != 0)[0] + 1   # indices where zone changes
     # Filter to transitions between two known zones (not involving -999/ignore)
@@ -380,11 +347,7 @@ def prepare_sequences(
     return X, y, y_edge, depth_axes, wells
 
 
-# ---------------------------------------------------------------------------
-# CLASS-BALANCED LOSS
-# ---------------------------------------------------------------------------
-
-# Using effective number of samples instead of inverse frequency for more balanced approach
+# class weights from the effective number of samples rather than inverse frequency
 
 def effective_number_weights(
     y: np.ndarray,
@@ -405,10 +368,6 @@ def effective_number_weights(
 
     return torch.tensor(weights.astype(np.float32), dtype=torch.float32, device=device)
 
-
-# ---------------------------------------------------------------------------
-# TRAINING
-# ---------------------------------------------------------------------------
 
 def _edge_loss(edge_logits: torch.Tensor, y_edge: torch.Tensor) -> torch.Tensor:
     """BCE loss ignoring positions where y_edge == -1."""
@@ -554,19 +513,15 @@ def train_model(
     return model
 
 
-# ---------------------------------------------------------------------------
-# INFERENCE
-# ---------------------------------------------------------------------------
-
 def enforce_monotonic(zone_preds: np.ndarray, smooth_window: int = 11) -> np.ndarray:
     """
     Soft monotonic enforcement:
-      1. Median-smooth the raw predictions to remove single-sample spikes —
-         a noisy spike to zone 5 followed by a drop forces the hard clamp to
-         skip zone 4 entirely.  Smoothing prevents this.
+      1. Median-smooth the raw predictions to remove single-sample spikes.
+         Without this, a spike to zone 5 followed by a drop makes the hard
+         clamp skip zone 4 entirely.
       2. Then apply the hard monotonic clamp (sequence can never decrease).
 
-    smooth_window is in samples; at srate=2.0 the default 11 = ±10m.
+    smooth_window is in samples, the default 11 is ±20 in depth at srate=4.
     Keep it odd so the window is symmetric.
     """
     from scipy.ndimage import median_filter
@@ -619,10 +574,6 @@ def predict(
 
     return results
 
-
-# ---------------------------------------------------------------------------
-# EVALUATION
-# ---------------------------------------------------------------------------
 
 def top_depths_from_step_function(
     depth_arr: np.ndarray,
@@ -729,10 +680,6 @@ def evaluate_segmentation_metrics(
     return accuracy
 
 
-# ---------------------------------------------------------------------------
-# VISUALISATION
-# ---------------------------------------------------------------------------
-
 def plot_prediction(
     df_result: pd.DataFrame,
     log_cols: List[str] = DEFAULT_LOG_COLS,
@@ -775,7 +722,7 @@ def plot_prediction(
     colors   = plt.cm.tab10.colors
     ax_idx   = 0
 
-    # ---- Log tracks ----
+    # log tracks
     for col in log_cols:
         if col not in df_result.columns:
             continue
@@ -788,7 +735,7 @@ def plot_prediction(
         ax.invert_yaxis()
         ax_idx += 1
 
-    # ---- Zone step function ----
+    # zone step function
     ax_zone = axes[ax_idx]
     ax_zone.step(zone, depth, where="post", color="steelblue", lw=1.5)
     ax_zone.set_xlabel("Predicted zone")
@@ -797,7 +744,7 @@ def plot_prediction(
     ax_zone.invert_yaxis()
     ax_idx += 1
 
-    # ---- Probability curves ----
+    # zone probabilities
     if n_prob_axes:
         ax_prob = axes[ax_idx]
         for k, pc in enumerate(prob_cols):
@@ -810,7 +757,7 @@ def plot_prediction(
         ax_prob.invert_yaxis()
         ax_idx += 1
 
-    # ---- Edge probability ----
+    # edge probability
     if n_edge_axes:
         ax_edge = axes[ax_idx]
         ax_edge.plot(df_result["edge_prob"].values, depth, color="crimson", lw=0.9)
@@ -819,7 +766,7 @@ def plot_prediction(
         ax_edge.set_title("Edge")
         ax_edge.invert_yaxis()
 
-    # ---- Overlay GT tops on every axis ----
+    # ground-truth tops on every track
     if df_tops is not None and top_cols and well_name in df_tops.index:
         for i, col in enumerate(top_cols):
             td = df_tops.loc[well_name, col]
@@ -835,12 +782,8 @@ def plot_prediction(
     plt.show()
 
 
-# ---------------------------------------------------------------------------
-# MAIN PIPELINE
-# ---------------------------------------------------------------------------
-
 def run_pipeline(
-    # --- data ---
+    # data
     df_log_train: pd.DataFrame,
     df_tops_train: pd.DataFrame,
     training_well_list: List,
@@ -852,14 +795,14 @@ def run_pipeline(
     log_cols: List[str] = DEFAULT_LOG_COLS,
     depth_col: str = "DS_INDEX",
     well_col: str = "well_name",
-    # --- resampling ---
+    # resampling
     srate: float = 4,
     margin: float = 500.0,
     min_top_fraction: float = 0.65,
-    # --- depth window percentiles ---
+    # depth window percentiles
     lower_pct: float = 25.0,
     upper_pct: float = 75.0,
-    # --- model ---
+    # model
     patch_len: int = 16,
     stride: int = 8,
     d_model: int = 128,
@@ -868,7 +811,7 @@ def run_pipeline(
     d_ff: int = 256,
     n_markers: int = 0,
     dropout: float = 0.1,
-    # --- training ---
+    # training
     epochs: int = 50,
     batch_size: int = 16,
     lr: float = 1e-4,
